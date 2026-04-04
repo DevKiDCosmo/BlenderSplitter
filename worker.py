@@ -306,7 +306,6 @@ class DistributedRenderManager:
     def _collect_sync_files(self, blend_path):
         base_dir = os.path.dirname(blend_path)
         file_map = {os.path.abspath(blend_path): os.path.basename(blend_path)}
-        excluded_dirs = {"__pycache__", ".git", "dist", "raw-splits", "master"}
 
         def _add_file(abs_path):
             if not abs_path:
@@ -324,14 +323,6 @@ class DistributedRenderManager:
                 rel = os.path.join("external", os.path.basename(path))
             file_map[path] = rel
 
-        for current_root, dir_names, file_names in os.walk(base_dir):
-            dir_names[:] = [name for name in dir_names if name not in excluded_dirs]
-            for filename in file_names:
-                abs_path = os.path.join(current_root, filename)
-                if os.path.abspath(abs_path) == os.path.abspath(blend_path):
-                    continue
-                _add_file(abs_path)
-
         for lib in bpy.data.libraries:
             try:
                 _add_file(bpy.path.abspath(lib.filepath))
@@ -343,6 +334,18 @@ class DistributedRenderManager:
                 if getattr(image, "source", "") != "FILE":
                     continue
                 _add_file(bpy.path.abspath(image.filepath_raw or image.filepath))
+            except Exception:
+                continue
+
+        for sound in bpy.data.sounds:
+            try:
+                _add_file(bpy.path.abspath(sound.filepath))
+            except Exception:
+                continue
+
+        for clip in bpy.data.movieclips:
+            try:
+                _add_file(bpy.path.abspath(clip.filepath))
             except Exception:
                 continue
 
@@ -761,6 +764,7 @@ class DistributedRenderManager:
 
         self.last_integrity = "ok"
         tile = payload["tile"]
+        self._open_worker_render_view(tile)
         out_path = self._render_tile_to_path(scene, tile)
 
         with open(out_path, "rb") as fh:
@@ -774,6 +778,27 @@ class DistributedRenderManager:
             "tile": tile,
             "png_base64": png_b64,
         }
+
+    def _open_worker_render_view(self, tile):
+        try:
+            bpy.ops.render.view_show("INVOKE_DEFAULT")
+            self.status = f"Worker rendert Tile {tile.get('id')}"
+            return
+        except Exception:
+            pass
+
+        try:
+            bpy.ops.wm.window_new()
+            wm = bpy.context.window_manager
+            new_window = wm.windows[-1] if wm.windows else None
+            if new_window and new_window.screen and new_window.screen.areas:
+                area = new_window.screen.areas[0]
+                area.type = "IMAGE_EDITOR"
+                if "Render Result" in bpy.data.images:
+                    area.spaces.active.image = bpy.data.images["Render Result"]
+            self.status = f"Worker rendert Tile {tile.get('id')}"
+        except Exception:
+            self.status = f"Worker rendert Tile {tile.get('id')}"
 
     def _render_tile_to_path(self, scene, tile):
         render = scene.render

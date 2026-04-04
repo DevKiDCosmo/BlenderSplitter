@@ -13,6 +13,7 @@ from .tiles import generate_tiles, grid_for_worker_count, overlap_pixels
 from .worker import manager
 
 _preview_handler = None
+_camera_border_handler = None
 _ui_refresh_registered = False
 
 
@@ -163,6 +164,75 @@ def _draw_preview_callback():
             blf.position(0, px0 + 3, py1 - 14, 0)
             blf.size(0, 10.0)
             blf.draw(0, str(item.get("tile_id", "?")))
+    except Exception:
+        return
+
+
+def _draw_camera_border_callback():
+    try:
+        context = bpy.context
+        if context is None or context.region is None or context.region_data is None:
+            return
+        if getattr(context.region_data, "view_perspective", "") != "CAMERA":
+            return
+
+        mgr = manager()
+        cfg = context.scene.blendersplitter_settings
+        plan = _build_preview_plan(cfg, mgr)
+        if not plan:
+            return
+
+        region = context.region
+        render = context.scene.render
+        aspect = (
+            float(render.resolution_x) * float(getattr(render, "pixel_aspect_x", 1.0))
+        ) / max(1e-6, float(render.resolution_y) * float(getattr(render, "pixel_aspect_y", 1.0)))
+        region_aspect = float(region.width) / max(1.0, float(region.height))
+
+        if region_aspect > aspect:
+            frame_h = float(region.height) * 0.86
+            frame_w = frame_h * aspect
+        else:
+            frame_w = float(region.width) * 0.86
+            frame_h = frame_w / max(1e-6, aspect)
+
+        x0 = (float(region.width) - frame_w) * 0.5
+        y0 = (float(region.height) - frame_h) * 0.5
+        x1 = x0 + frame_w
+        y1 = y0 + frame_h
+
+        shader = gpu.shader.from_builtin("2D_UNIFORM_COLOR")
+        outline = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        batch = batch_for_shader(shader, "LINE_STRIP", {"pos": outline})
+        shader.bind()
+        shader.uniform_float("color", (0.95, 0.85, 0.15, 0.95))
+        batch.draw(shader)
+
+        res_x = max(1, int(render.resolution_x * (render.resolution_percentage / 100.0)))
+        res_y = max(1, int(render.resolution_y * (render.resolution_percentage / 100.0)))
+
+        for item in plan:
+            min_x = float(item.get("min_x", 0)) / float(max(1, res_x))
+            max_x = float(item.get("max_x", 0)) / float(max(1, res_x))
+            min_y = float(item.get("min_y", 0)) / float(max(1, res_y))
+            max_y = float(item.get("max_y", 0)) / float(max(1, res_y))
+
+            px0 = x0 + min_x * frame_w
+            px1 = x0 + max_x * frame_w
+            py0 = y0 + (1.0 - max_y) * frame_h
+            py1 = y0 + (1.0 - min_y) * frame_h
+
+            verts = [
+                (px0, py0),
+                (px1, py0),
+                (px1, py1),
+                (px0, py0),
+                (px1, py1),
+                (px0, py1),
+            ]
+            batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+            shader.uniform_float("color", _color_for_target(item.get("target")))
+            batch.draw(shader)
     except Exception:
         return
 
@@ -682,6 +752,10 @@ def register():
         bpy.app.timers.register(_ui_refresh_tick, persistent=True)
         _ui_refresh_registered = True
 
+    global _camera_border_handler
+    if _camera_border_handler is None:
+        _camera_border_handler = bpy.types.SpaceView3D.draw_handler_add(_draw_camera_border_callback, (), "WINDOW", "POST_PIXEL")
+
 
 def unregister():
     if hasattr(bpy.types.Scene, "blendersplitter_settings"):
@@ -694,6 +768,14 @@ def unregister():
         except Exception:
             pass
         _preview_handler = None
+
+    global _camera_border_handler
+    if _camera_border_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_camera_border_handler, "WINDOW")
+        except Exception:
+            pass
+        _camera_border_handler = None
 
     global _ui_refresh_registered
     _ui_refresh_registered = False
