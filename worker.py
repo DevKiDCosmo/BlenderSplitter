@@ -93,6 +93,7 @@ class DistributedRenderManager:
         self.auto_sync_project = False
         self.show_render_window = True
         self.server_render_tiles = True
+        self.tile_coefficient = 1
         self.output_dir = ""
 
         self.connected_workers = {}
@@ -105,6 +106,9 @@ class DistributedRenderManager:
         self.render_start_time = 0.0
         self.job_owner = {}
         self.job_attempts = {}
+        self.job_queue = []
+        self.target_inflight = {}
+        self.dispatch_targets = []
 
         self.current_output_root = ""
         self.current_master_dir = ""
@@ -117,6 +121,8 @@ class DistributedRenderManager:
         self.incoming_project_progress = {}
         self.received_project_dir = ""
         self.pending_project_load = None
+        self.pending_project_load_attempts = 0
+        self.pending_project_load_retry_at = 0.0
         self.pending_sync_context = None
         self.project_sync_results = {}
         self.integrity_probe_results = {}
@@ -159,6 +165,7 @@ class DistributedRenderManager:
         auto_sync_project=False,
         show_render_window=True,
         server_render_tiles=True,
+        tile_coefficient=1,
         output_dir="",
     ):
         self.server_host = str(host)
@@ -169,6 +176,7 @@ class DistributedRenderManager:
         self.auto_sync_project = bool(auto_sync_project)
         self.show_render_window = bool(show_render_window)
         self.server_render_tiles = bool(server_render_tiles)
+        self.tile_coefficient = max(1, int(tile_coefficient))
         self.output_dir = bpy.path.abspath(output_dir) if output_dir else ""
 
     def start(self):
@@ -240,7 +248,7 @@ class DistributedRenderManager:
         self._timer_registered = True
 
     def process_main_thread_queues(self):
-        if self.pending_project_load:
+        if self.pending_project_load and time.time() >= float(self.pending_project_load_retry_at):
             try:
                 blend_file = self.pending_project_load
                 self.status = f"Lade Projekt: {os.path.basename(blend_file)}"
@@ -248,9 +256,21 @@ class DistributedRenderManager:
                 self._activate_synced_job_context()
                 self.status = f"Projekt geladen: {os.path.basename(blend_file)}"
                 self.pending_project_load = None
+                self.pending_project_load_attempts = 0
+                self.pending_project_load_retry_at = 0.0
             except Exception as exc:
+                self.pending_project_load_attempts += 1
                 self.last_error = f"Projekt laden fehlgeschlagen: {exc}"
-                self.status = self.last_error
+                if self.pending_project_load_attempts >= 5:
+                    self.status = f"Projekt laden endgültig fehlgeschlagen ({self.pending_project_load_attempts}): {exc}"
+                    self.pending_project_load = None
+                    self.pending_project_load_attempts = 0
+                    self.pending_project_load_retry_at = 0.0
+                else:
+                    self.pending_project_load_retry_at = time.time() + 2.0
+                    self.status = (
+                        f"Projekt laden Retry {self.pending_project_load_attempts}/5 in 2s: {os.path.basename(self.pending_project_load)}"
+                    )
 
         while not self._progress_queue.empty():
             self.status = self._progress_queue.get_nowait()
@@ -1140,6 +1160,8 @@ class DistributedRenderManager:
 
         self.pending_sync_context = transfer.get("sync_context", {})
         self.pending_project_load = blend_path
+        self.pending_project_load_attempts = 0
+        self.pending_project_load_retry_at = 0.0
 
         return {
             "ok": True,
@@ -1188,6 +1210,7 @@ class DistributedRenderManager:
 
         node_count = len(workers) + (1 if self.server_render_tiles else 0)
         grid_x, grid_y = grid_for_worker_count(max(1, node_count))
+        grid_x = max(1, int(grid_x) * max(1, int(self.tile_coefficient)))
         overlap_px = overlap_pixels(final_width, final_height, self.overlap_percent)
         tiles = generate_tiles(final_width, final_height, grid_x, grid_y, overlap=overlap_px)
 
@@ -1210,6 +1233,9 @@ class DistributedRenderManager:
         self.completed_jobs = {}
         self.job_owner = {}
         self.job_attempts = {}
+        self.job_queue = []
+        self.target_inflight = {}
+        self.dispatch_targets = []
         self.render_plan = []
         self.expected_jobs = len(tiles)
         self.render_start_time = time.time()
@@ -1224,59 +1250,64 @@ class DistributedRenderManager:
             self.status = self.last_error
             return False
 
-        # Fair quotas: all nodes get almost equal work; extra tiles go to workers first.
-        base_count = len(tiles) // len(targets)
-        remainder = len(tiles) % len(targets)
-        quota = {target: base_count for target in targets}
-        remainder_priority = [target for target in targets if target != "MASTER"]
-        if "MASTER" in targets:
-            remainder_priority.append("MASTER")
-        for target in remainder_priority[:remainder]:
-            quota[target] += 1
+        self.dispatch_targets = list(targets)
+        self.target_inflight = {target: 0 for target in self.dispatch_targets}
 
-        dispatch_targets = []
-        used = {target: 0 for target in targets}
-        cursor = 0
-        while len(dispatch_targets) < len(tiles):
-            target = targets[cursor % len(targets)]
-            cursor += 1
-            if used[target] >= quota[target]:
-                continue
-            dispatch_targets.append(target)
-            used[target] += 1
-
-        for idx, tile in enumerate(tiles):
-            target = dispatch_targets[idx]
+        # Queue all jobs first; dispatch continuously as targets become free.
+        for tile in tiles:
             job = {
                 "type": MSG_RENDER_TILE,
                 "tile_id": tile["id"],
                 "tile": tile,
                 "render_signature": signature,
             }
-            self.pending_jobs[tile["id"]] = job
             self.job_attempts[tile["id"]] = 0
-            self.job_owner[tile["id"]] = target
-            self.render_plan.append(
-                {
-                    "tile_id": tile["id"],
-                    "target": target,
-                    "min_x": tile["min_x"],
-                    "max_x": tile["max_x"],
-                    "min_y": tile["min_y"],
-                    "max_y": tile["max_y"],
-                    "core_min_x": tile["core_min_x"],
-                    "core_max_x": tile["core_max_x"],
-                    "core_min_y": tile["core_min_y"],
-                    "core_max_y": tile["core_max_y"],
-                }
-            )
+            self.job_queue.append(job)
 
-            if target == "MASTER":
-                self._task_queue.put({"type": "render_tile", "payload": job, "reply_to": "server_local"})
-            else:
-                self._send_job_to_worker(target, job)
+        # Prime each target with one job.
+        for target in self.dispatch_targets:
+            self._dispatch_next_job_for_target(target)
 
-        self.status = f"Render gestartet: {len(tiles)} Tiles, {len(targets)} Ziele"
+        self.status = f"Render gestartet: {len(tiles)} Tiles, {len(self.dispatch_targets)} Ziele"
+        return True
+
+    def _dispatch_next_job_for_target(self, target):
+        if target not in self.dispatch_targets:
+            return False
+        if self.target_inflight.get(target, 0) > 0:
+            return False
+
+        if target != "MASTER" and target not in self.connected_workers:
+            return False
+
+        if not self.job_queue:
+            return False
+
+        job = self.job_queue.pop(0)
+        tile = job.get("tile", {})
+        tile_id = job.get("tile_id")
+        self.pending_jobs[tile_id] = job
+        self.job_owner[tile_id] = target
+        self.target_inflight[target] = self.target_inflight.get(target, 0) + 1
+        self.render_plan.append(
+            {
+                "tile_id": tile_id,
+                "target": target,
+                "min_x": tile.get("min_x", 0),
+                "max_x": tile.get("max_x", 0),
+                "min_y": tile.get("min_y", 0),
+                "max_y": tile.get("max_y", 0),
+                "core_min_x": tile.get("core_min_x", tile.get("min_x", 0)),
+                "core_max_x": tile.get("core_max_x", tile.get("max_x", 0)),
+                "core_min_y": tile.get("core_min_y", tile.get("min_y", 0)),
+                "core_max_y": tile.get("core_max_y", tile.get("max_y", 0)),
+            }
+        )
+
+        if target == "MASTER":
+            self._task_queue.put({"type": "render_tile", "payload": job, "reply_to": "server_local"})
+        else:
+            self._send_job_to_worker(target, job)
         return True
 
     def _open_live_render_view(self):
@@ -1338,6 +1369,8 @@ class DistributedRenderManager:
         if tile_id not in self.pending_jobs:
             return
 
+        owner = self.job_owner.get(tile_id)
+
         if not message.get("ok"):
             self._reassign_tile(tile_id, message.get("error", "Unbekannter Fehler"))
             return
@@ -1377,10 +1410,13 @@ class DistributedRenderManager:
         }
         del self.pending_jobs[tile_id]
         self.job_owner.pop(tile_id, None)
+        if owner:
+            self.target_inflight[owner] = max(0, int(self.target_inflight.get(owner, 1)) - 1)
+            self._dispatch_next_job_for_target(owner)
 
         done = len(self.completed_jobs)
         self.status = f"Tiles fertig: {done}/{self.expected_jobs}"
-        if done >= self.expected_jobs:
+        if done >= self.expected_jobs and not self.pending_jobs and not self.job_queue:
             self._finalize_render()
 
     def _finalize_render(self):
@@ -1403,9 +1439,16 @@ class DistributedRenderManager:
             traceback.print_exc()
 
     def _reassign_jobs_from_worker(self, worker_id):
+        if worker_id in self.dispatch_targets:
+            self.dispatch_targets = [t for t in self.dispatch_targets if t != worker_id]
+            self.target_inflight.pop(worker_id, None)
+
         for tile_id, owner in list(self.job_owner.items()):
             if owner == worker_id and tile_id in self.pending_jobs:
                 self._reassign_tile(tile_id, f"Worker {worker_id} getrennt")
+
+        for target in list(self.dispatch_targets):
+            self._dispatch_next_job_for_target(target)
 
     def _reassign_tile(self, tile_id, reason):
         if tile_id not in self.pending_jobs:
@@ -1415,6 +1458,8 @@ class DistributedRenderManager:
         self.job_attempts[tile_id] = attempt
         job = self.pending_jobs[tile_id]
         prev_owner = self.job_owner.get(tile_id)
+        if prev_owner:
+            self.target_inflight[prev_owner] = max(0, int(self.target_inflight.get(prev_owner, 1)) - 1)
 
         if attempt > self.max_retries:
             self.last_error = f"Tile {tile_id} fehlgeschlagen nach {attempt - 1} Retries: {reason}"
@@ -1422,9 +1467,20 @@ class DistributedRenderManager:
             self.last_integrity = "failed"
             return
 
-        candidates = [wid for wid in self.connected_workers.keys() if wid != prev_owner]
-        target = random.choice(candidates) if candidates else "MASTER"
+        active_workers = [wid for wid in self.connected_workers.keys() if wid in self.dispatch_targets and wid != prev_owner]
+        candidates = list(active_workers)
+        if "MASTER" in self.dispatch_targets:
+            candidates.append("MASTER")
+        if not candidates:
+            candidates = ["MASTER"] if self.server_render_tiles else []
+        if not candidates:
+            self.last_error = f"Tile {tile_id} kann nicht neu zugewiesen werden: {reason}"
+            self.status = self.last_error
+            return
+
+        target = min(candidates, key=lambda t: int(self.target_inflight.get(t, 0)))
         self.job_owner[tile_id] = target
+        self.target_inflight[target] = int(self.target_inflight.get(target, 0)) + 1
 
         if target == "MASTER":
             self._task_queue.put({"type": "render_tile", "payload": job, "reply_to": "server_local"})

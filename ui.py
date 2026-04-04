@@ -57,6 +57,7 @@ def _build_preview_plan(cfg, mgr):
 
     total_nodes = cfg.worker_count + (1 if cfg.server_render_tiles else 0)
     grid_x, grid_y = grid_for_worker_count(max(1, total_nodes))
+    grid_x = max(1, int(grid_x) * max(1, int(cfg.tile_coefficient)))
     overlap = overlap_pixels(res_x, res_y, cfg.overlap_percent)
     tiles = generate_tiles(res_x, res_y, grid_x, grid_y, overlap=overlap)
 
@@ -313,6 +314,7 @@ class BLENDERSPLITTER_OT_start_network(bpy.types.Operator):
             cfg.auto_sync_project,
             cfg.show_render_window,
             cfg.server_render_tiles,
+            cfg.tile_coefficient,
             cfg.output_dir,
         )
         mgr.start()
@@ -346,6 +348,7 @@ class BLENDERSPLITTER_OT_start_server(bpy.types.Operator):
             cfg.auto_sync_project,
             cfg.show_render_window,
             cfg.server_render_tiles,
+            cfg.tile_coefficient,
             cfg.output_dir,
         )
         ok = mgr.force_start_server()
@@ -571,6 +574,7 @@ class BLENDERSPLITTER_PG_settings(bpy.types.PropertyGroup):
     discovery_port: bpy.props.IntProperty(name="Discovery Port", default=8766, min=1024, max=65535)
     overlap_percent: bpy.props.FloatProperty(name="Overlap %", default=3.0, min=2.0, max=8.0)
     worker_count: bpy.props.IntProperty(name="Worker Count", default=4, min=1, max=256)
+    tile_coefficient: bpy.props.IntProperty(name="Tile Koeffizient", default=1, min=1, max=16)
     max_retries: bpy.props.IntProperty(name="Max Retries", default=3, min=1, max=20)
     auto_sync_project: bpy.props.BoolProperty(name="Auto Sync Project", default=False)
     show_render_window: bpy.props.BoolProperty(name="Show Render Window", default=True)
@@ -598,6 +602,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         layout.prop(cfg, "output_dir")
         layout.prop(cfg, "overlap_percent")
         layout.prop(cfg, "worker_count")
+        layout.prop(cfg, "tile_coefficient")
         layout.prop(cfg, "max_retries")
         layout.prop(cfg, "auto_sync_project")
         layout.prop(cfg, "server_render_tiles")
@@ -650,6 +655,7 @@ class BLENDERSPLITTER_PT_tile_preview(bpy.types.Panel):
 
         layout.label(text="Preview & Overlap")
         layout.prop(cfg, "worker_count")
+        layout.prop(cfg, "tile_coefficient")
         layout.prop(cfg, "overlap_percent")
 
         layout.operator("blendersplitter.toggle_preview_overlay", icon="IMAGE_DATA")
