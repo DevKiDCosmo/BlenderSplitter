@@ -1,4 +1,5 @@
 import hashlib
+import math
 
 
 def overlap_pixels(res_x: int, res_y: int, overlap_percent: float) -> int:
@@ -17,6 +18,40 @@ def grid_for_worker_count(count: int) -> tuple[int, int]:
         else:
             gy += 1
     return gx, gy
+
+
+def tile_target_for_workers(worker_count: int, tile_coefficient: int = 1) -> int:
+    worker_count = max(1, int(worker_count))
+    tile_coefficient = max(1, int(tile_coefficient))
+
+    # Use a "good" rectangular base split derived from active nodes.
+    # Examples: 2 -> 2 tiles, 3 -> 4 tiles, 4 -> 4 tiles.
+    gx, gy = grid_for_worker_count(worker_count)
+    base_tiles = max(1, int(gx) * int(gy))
+    multiplier = 2 ** max(0, tile_coefficient - 1)
+    return base_tiles * multiplier
+
+
+def grid_for_tile_count(tile_count: int, res_x: int, res_y: int) -> tuple[int, int]:
+    tile_count = max(1, int(tile_count))
+    res_x = max(1, int(res_x))
+    res_y = max(1, int(res_y))
+
+    target_aspect = float(res_x) / float(res_y)
+    best = (tile_count, 1)
+    best_score = float("inf")
+
+    for tiles_x in range(1, tile_count + 1):
+        if tile_count % tiles_x != 0:
+            continue
+        tiles_y = tile_count // tiles_x
+        aspect = float(tiles_x) / float(tiles_y)
+        score = abs(math.log(max(1e-9, aspect / target_aspect)))
+        if score < best_score:
+            best = (tiles_x, tiles_y)
+            best_score = score
+
+    return best
 
 
 def generate_tiles(res_x: int, res_y: int, tiles_x: int, tiles_y: int, overlap: int = 0) -> list[dict]:

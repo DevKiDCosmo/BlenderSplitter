@@ -32,6 +32,7 @@ from .robust_protocol import (
     MSG_REGISTER_WORKER,
     MSG_REGISTERED,
     MSG_RENDER_TILE,
+    MSG_RENDER_ABORT,
     MSG_TILE_RESULT,
     MSG_TILE_RESULT_CHUNK,
     MSG_TILE_RESULT_COMPLETE,
@@ -40,7 +41,7 @@ from .robust_protocol import (
 )
 from .robust_transfer import ChunkConfig, TileResultAssembler, TileResultChunker
 from .stitch import stitch_tiles
-from .tiles import collect_render_signature, generate_tiles, grid_for_worker_count, overlap_pixels
+from .tiles import collect_render_signature, generate_tiles, grid_for_tile_count, tile_target_for_workers, overlap_pixels
 
 try:
     import websockets
@@ -109,6 +110,8 @@ class DistributedRenderManager:
         self.job_attempts = {}
         self.job_queue = []
         self.target_inflight = {}
+        self.target_ready_at = {}
+        self.dispatch_cooldown_seconds = 1.0
         self.dispatch_targets = []
 
         self.current_output_root = ""
@@ -124,7 +127,11 @@ class DistributedRenderManager:
         self.pending_project_load = None
         self.pending_project_load_attempts = 0
         self.pending_project_load_retry_at = 0.0
+        self.pending_blank_reset = False
+        self.pending_blank_reset_attempts = 0
+        self.pending_blank_reset_retry_at = 0.0
         self.pending_sync_context = None
+        self.render_abort_requested = False
         self.project_sync_results = {}
         self.integrity_probe_results = {}
         self._incoming_project = None
@@ -249,6 +256,25 @@ class DistributedRenderManager:
         self._timer_registered = True
 
     def process_main_thread_queues(self):
+        if self.pending_blank_reset and time.time() >= float(self.pending_blank_reset_retry_at):
+            try:
+                try:
+                    bpy.ops.wm.read_homefile(use_empty=True)
+                except Exception:
+                    bpy.ops.wm.read_factory_settings(use_empty=True)
+                self._worker_render_view_opened = False
+                self.pending_blank_reset = False
+                self.pending_blank_reset_attempts = 0
+                self.pending_blank_reset_retry_at = 0.0
+                self.status = "Blank Instanz geladen"
+            except Exception as exc:
+                self.pending_blank_reset_attempts += 1
+                if self.pending_blank_reset_attempts >= 5:
+                    self.pending_blank_reset = False
+                    self.last_error = f"Blank-Reset fehlgeschlagen: {exc}"
+                    self.status = self.last_error
+                else:
+                    self.pending_blank_reset_retry_at = time.time() + min(1.5, 0.2 * self.pending_blank_reset_attempts)
         if self.pending_project_load and time.time() >= float(self.pending_project_load_retry_at):
             try:
                 blend_file = self.pending_project_load
@@ -279,6 +305,8 @@ class DistributedRenderManager:
         while not self._task_queue.empty():
             item = self._task_queue.get_nowait()
             if item.get("type") == "render_tile":
+                if self.render_abort_requested:
+                    continue
                 result = self._render_tile_local(item["payload"])
                 if item.get("reply_to") == "server_local":
                     self._result_queue.put(result)
@@ -287,6 +315,12 @@ class DistributedRenderManager:
 
         while not self._result_queue.empty():
             self._consume_tile_result(self._result_queue.get_nowait())
+
+        # Try dispatching queued jobs continuously; cooldown is enforced per target.
+        if self.role == "server" and self.current_render_config and not self.render_abort_requested:
+            for target in list(self.dispatch_targets):
+                if self.target_inflight.get(target, 0) <= 0:
+                    self._dispatch_next_job_for_target(target)
 
     def _capture_sync_context(self, scene):
         render = scene.render
@@ -667,6 +701,11 @@ class DistributedRenderManager:
                 # clear state
                 self.received_project_dir = ""
                 self.pending_project_load = None
+                self.pending_project_load_attempts = 0
+                self.pending_project_load_retry_at = 0.0
+                self.pending_blank_reset = True
+                self.pending_blank_reset_attempts = 0
+                self.pending_blank_reset_retry_at = 0.0
                 self.pending_sync_context = None
                 self.status = f"Cleaned {deleted} blend(s)"
             except Exception as exc:
@@ -679,7 +718,23 @@ class DistributedRenderManager:
             return
 
         if msg_type == MSG_RENDER_TILE:
+            if self.render_abort_requested:
+                return
             self._task_queue.put({"type": "render_tile", "payload": msg})
+            return
+
+        if msg_type == MSG_RENDER_ABORT:
+            self.render_abort_requested = True
+            self.pending_jobs = {}
+            self.job_owner = {}
+            self.job_attempts = {}
+            self.job_queue = []
+            self.target_inflight = {target: 0 for target in self.dispatch_targets}
+            try:
+                bpy.ops.render.cancel()
+            except Exception:
+                pass
+            self.status = "Render-Abbruch empfangen"
             return
 
         if msg_type == MSG_INTEGRITY_PROBE:
@@ -801,6 +856,9 @@ class DistributedRenderManager:
             return
 
     def _render_tile_local(self, payload):
+        if self.render_abort_requested:
+            return {"type": MSG_TILE_RESULT, "tile_id": payload.get("tile_id"), "ok": False, "error": "Render abgebrochen"}
+
         scene = _safe_scene()
         if scene is None:
             return {"type": MSG_TILE_RESULT, "tile_id": payload.get("tile_id"), "ok": False, "error": "Keine Szene"}
@@ -954,6 +1012,42 @@ class DistributedRenderManager:
         self.current_raw_splits_dir = os.path.join(run_root, "raw-splits")
         os.makedirs(self.current_master_dir, exist_ok=True)
         os.makedirs(self.current_raw_splits_dir, exist_ok=True)
+
+    def _show_final_image_in_editor(self, output_path):
+        try:
+            if bpy.context is None:
+                return
+            image = bpy.data.images.load(output_path, check_existing=True)
+            wm = bpy.context.window_manager
+            if wm is None:
+                return
+
+            target_window = None
+            for window in wm.windows:
+                screen = window.screen
+                if not screen:
+                    continue
+                for area in screen.areas:
+                    if area.type == "IMAGE_EDITOR":
+                        target_window = window
+                        try:
+                            area.spaces.active.image = image
+                        except Exception:
+                            pass
+                        return
+
+            if wm.windows:
+                target_window = wm.windows[0]
+                screen = target_window.screen
+                if screen and screen.areas:
+                    area = screen.areas[0]
+                    area.type = "IMAGE_EDITOR"
+                    try:
+                        area.spaces.active.image = image
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _build_project_bundle(self):
         blend_path = bpy.data.filepath
@@ -1233,7 +1327,23 @@ class DistributedRenderManager:
                 self.last_error = self.status
                 return False
 
+        # Refresh runtime settings from the current UI so Output Folder changes apply immediately.
         scene = _safe_scene()
+        if scene is not None and hasattr(scene, "blendersplitter_settings"):
+            cfg = scene.blendersplitter_settings
+            self.configure(
+                cfg.host,
+                cfg.server_port,
+                cfg.discovery_port,
+                cfg.overlap_percent,
+                cfg.max_retries,
+                cfg.auto_sync_project,
+                cfg.show_render_window,
+                cfg.server_render_tiles,
+                cfg.tile_coefficient,
+                cfg.output_dir,
+            )
+
         if scene is None:
             self.last_error = "Keine aktive Szene"
             self.status = self.last_error
@@ -1265,8 +1375,8 @@ class DistributedRenderManager:
             return False
 
         node_count = len(workers) + (1 if self.server_render_tiles else 0)
-        grid_x, grid_y = grid_for_worker_count(max(1, node_count))
-        grid_x = max(1, int(grid_x) * max(1, int(self.tile_coefficient)))
+        tile_count = tile_target_for_workers(max(1, node_count), self.tile_coefficient)
+        grid_x, grid_y = grid_for_tile_count(tile_count, final_width, final_height)
         overlap_px = overlap_pixels(final_width, final_height, self.overlap_percent)
         tiles = generate_tiles(final_width, final_height, grid_x, grid_y, overlap=overlap_px)
 
@@ -1285,12 +1395,14 @@ class DistributedRenderManager:
             "resolution_x": final_width,
             "resolution_y": final_height,
         }
+        self.render_abort_requested = False
         self.pending_jobs = {}
         self.completed_jobs = {}
         self.job_owner = {}
         self.job_attempts = {}
         self.job_queue = []
         self.target_inflight = {}
+        self.target_ready_at = {}
         self.dispatch_targets = []
         self.render_plan = []
         self.expected_jobs = len(tiles)
@@ -1308,6 +1420,7 @@ class DistributedRenderManager:
 
         self.dispatch_targets = list(targets)
         self.target_inflight = {target: 0 for target in self.dispatch_targets}
+        self.target_ready_at = {target: 0.0 for target in self.dispatch_targets}
 
         # Queue all jobs first; dispatch continuously as targets become free.
         for tile in tiles:
@@ -1328,7 +1441,11 @@ class DistributedRenderManager:
         return True
 
     def _dispatch_next_job_for_target(self, target):
+        if self.render_abort_requested:
+            return False
         if target not in self.dispatch_targets:
+            return False
+        if time.time() < float(self.target_ready_at.get(target, 0.0)):
             return False
         if self.target_inflight.get(target, 0) > 0:
             return False
@@ -1406,7 +1523,7 @@ class DistributedRenderManager:
     def _send_job_to_worker(self, worker_id, job):
         info = self.connected_workers.get(worker_id)
         if not info:
-            self._reassign_tile(job["tile_id"], f"Worker {worker_id} nicht verfügbar")
+            self._retry_or_requeue_job(job, f"Worker {worker_id} nicht verfügbar")
             return
 
         ws = info.get("socket")
@@ -1415,10 +1532,37 @@ class DistributedRenderManager:
             try:
                 await ws.send(json_dumps(job))
             except Exception as exc:
-                self._reassign_tile(job["tile_id"], f"Sendefehler: {exc}")
+                self._retry_or_requeue_job(job, f"Sendefehler: {exc}")
 
         if self._loop:
             asyncio.run_coroutine_threadsafe(_send(), self._loop)
+
+    def _retry_or_requeue_job(self, job, reason):
+        tile_id = job.get("tile_id")
+        if tile_id is None:
+            return
+
+        attempts = int(job.get("send_attempts", 0)) + 1
+        job["send_attempts"] = attempts
+
+        prev_owner = self.job_owner.get(tile_id)
+        if prev_owner:
+            self.target_inflight[prev_owner] = max(0, int(self.target_inflight.get(prev_owner, 1)) - 1)
+            self.job_owner.pop(tile_id, None)
+
+        if attempts > self.max_retries:
+            self.last_error = f"Tile {tile_id} konnte nicht gesendet werden nach {attempts - 1} Retries: {reason}"
+            self.status = self.last_error
+            self.last_integrity = "failed"
+            self.pending_jobs.pop(tile_id, None)
+            return
+
+        self.job_queue.insert(0, job)
+        self.status = f"Tile {tile_id} erneut eingeplant ({attempts}/{self.max_retries})"
+        for target in list(self.dispatch_targets):
+            if self.target_inflight.get(target, 0) == 0:
+                self._dispatch_next_job_for_target(target)
+                break
 
     def _consume_tile_result(self, message):
         tile_id = message.get("tile_id")
@@ -1468,6 +1612,7 @@ class DistributedRenderManager:
         self.job_owner.pop(tile_id, None)
         if owner:
             self.target_inflight[owner] = max(0, int(self.target_inflight.get(owner, 1)) - 1)
+            self.target_ready_at[owner] = time.time() + float(self.dispatch_cooldown_seconds)
             self._dispatch_next_job_for_target(owner)
 
         done = len(self.completed_jobs)
@@ -1489,6 +1634,7 @@ class DistributedRenderManager:
             self.last_duration_seconds = time.time() - self.render_start_time
             self.last_integrity = "ok"
             self.status = f"Render abgeschlossen in {self.last_duration_seconds:.2f}s"
+            self._show_final_image_in_editor(self.current_render_output)
         except Exception as exc:
             self.last_error = f"Stitch fehlgeschlagen: {exc}"
             self.status = self.last_error
@@ -1498,6 +1644,7 @@ class DistributedRenderManager:
         if worker_id in self.dispatch_targets:
             self.dispatch_targets = [t for t in self.dispatch_targets if t != worker_id]
             self.target_inflight.pop(worker_id, None)
+            self.target_ready_at.pop(worker_id, None)
 
         for tile_id, owner in list(self.job_owner.items()):
             if owner == worker_id and tile_id in self.pending_jobs:
@@ -1602,14 +1749,34 @@ class DistributedRenderManager:
         if not self.current_render_config:
             self.status = "Kein Render aktiv"
             return False
+        self.render_abort_requested = True
         self.pending_jobs.clear()
         self.job_owner.clear()
         self.job_attempts.clear()
+        self.job_queue = []
+        self.target_inflight = {target: 0 for target in self.dispatch_targets}
         self.expected_jobs = 0
         self.current_render_config = None
         self.current_render_output = ""
         self.last_integrity = "aborted"
         self.status = "Render abgebrochen"
+
+        async def _broadcast_abort():
+            for worker_id in list(self.connected_workers.keys()):
+                info = self.connected_workers.get(worker_id)
+                ws = info.get("socket") if info else None
+                if ws is None:
+                    continue
+                try:
+                    await ws.send(json_dumps({"type": MSG_RENDER_ABORT}))
+                except Exception:
+                    pass
+
+        if self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(_broadcast_abort(), self._loop)
+            except Exception:
+                pass
         return True
 
     def kick_all_workers(self):

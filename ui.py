@@ -9,7 +9,7 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
-from .tiles import generate_tiles, grid_for_worker_count, overlap_pixels
+from .tiles import generate_tiles, grid_for_tile_count, tile_target_for_workers, overlap_pixels
 from .worker import manager
 
 _preview_handler = None
@@ -47,7 +47,7 @@ def _color_for_target(target):
 
 
 def _build_preview_plan(cfg, mgr):
-    if mgr.render_plan:
+    if mgr.current_render_config and mgr.render_plan:
         return mgr.render_plan
 
     scene = bpy.context.scene
@@ -55,9 +55,13 @@ def _build_preview_plan(cfg, mgr):
     res_x = max(1, int(render.resolution_x * (render.resolution_percentage / 100.0)))
     res_y = max(1, int(render.resolution_y * (render.resolution_percentage / 100.0)))
 
-    total_nodes = cfg.worker_count + (1 if cfg.server_render_tiles else 0)
-    grid_x, grid_y = grid_for_worker_count(max(1, total_nodes))
-    grid_x = max(1, int(grid_x) * max(1, int(cfg.tile_coefficient)))
+    if mgr.role == "server" and mgr.started and mgr.connected_workers:
+        total_nodes = len(mgr.connected_workers) + (1 if cfg.server_render_tiles else 0)
+    else:
+        total_nodes = cfg.worker_count + (1 if cfg.server_render_tiles else 0)
+
+    tile_count = tile_target_for_workers(max(1, total_nodes), cfg.tile_coefficient)
+    grid_x, grid_y = grid_for_tile_count(tile_count, res_x, res_y)
     overlap = overlap_pixels(res_x, res_y, cfg.overlap_percent)
     tiles = generate_tiles(res_x, res_y, grid_x, grid_y, overlap=overlap)
 
@@ -621,6 +625,14 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         layout.prop(cfg, "server_render_tiles")
         layout.prop(cfg, "show_render_window")
 
+        summary = layout.box()
+        plan = _build_preview_plan(cfg, mgr)
+        summary.label(text="Tile Plan")
+        summary.label(text=f"Planned Tiles: {len(plan)}")
+        if mgr.expected_jobs > 0:
+            summary.label(text=f"Rendered: {len(mgr.completed_jobs)}/{mgr.expected_jobs}")
+            summary.label(text=f"Pending/In-Flight: {len(mgr.job_queue)}/{len(mgr.pending_jobs)}")
+
         row = layout.row(align=True)
         row.operator("blendersplitter.start_network", icon="PLAY")
         row.operator("blendersplitter.stop_network", icon="PAUSE")
@@ -677,9 +689,10 @@ class BLENDERSPLITTER_PT_tile_preview(bpy.types.Panel):
         layout.operator("blendersplitter.close_partition_image", icon="TRASH")
 
         plan = _build_preview_plan(cfg, mgr)
-        layout.label(text=f"Tiles: {len(plan)}")
+        box = layout.box()
+        box.label(text=f"Tiles: {len(plan)}")
         for item in plan[:16]:
-            row = layout.row(align=True)
+            row = box.row(align=True)
             row.label(text=f"{item.get('tile_id')} -> {item.get('target')}")
             row.label(text=f"[{item.get('core_min_x')},{item.get('core_min_y')}] - [{item.get('core_max_x')},{item.get('core_max_y')}]")
 

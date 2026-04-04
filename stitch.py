@@ -7,9 +7,9 @@ def stitch_tiles(tile_results: list[dict], width: int, height: int, output_path:
 
     base = Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
-    # Sort rows top->bottom then left->right. Use descending Y so
-    # tiles that lie visually on top (higher Y in Blender coordinate
-    # space) are composed after lower ones when overlaps exist.
+    # Blender tile coordinates use Y-up (origin at image bottom),
+    # while PIL uses Y-down (origin at image top).
+    # Sort deterministic by Blender-space rows and columns.
     ordered = sorted(
         tile_results,
         key=lambda t: (
@@ -24,6 +24,7 @@ def stitch_tiles(tile_results: list[dict], width: int, height: int, output_path:
 
         min_x = int(tile["min_x"])
         min_y = int(tile["min_y"])
+        max_y = int(tile["max_y"])
         core_min_x = int(tile.get("core_min_x", min_x))
         core_max_x = int(tile.get("core_max_x", int(tile["max_x"])))
         core_min_y = int(tile.get("core_min_y", min_y))
@@ -31,10 +32,13 @@ def stitch_tiles(tile_results: list[dict], width: int, height: int, output_path:
 
         left = max(0, core_min_x - min_x)
         right = left + max(1, core_max_x - core_min_x)
-        top = max(0, core_min_y - min_y)
+        # Convert crop Y from Blender bottom-origin to tile-image top-origin.
+        top = max(0, max_y - core_max_y)
         bottom = top + max(1, core_max_y - core_min_y)
 
         crop = tile_img.crop((left, top, right, bottom))
-        base.alpha_composite(crop, (core_min_x, core_min_y))
+        # Convert paste Y from Blender bottom-origin to PIL top-origin.
+        paste_y = max(0, height - core_max_y)
+        base.alpha_composite(crop, (core_min_x, paste_y))
 
     base.save(output_path)

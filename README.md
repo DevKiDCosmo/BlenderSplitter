@@ -1,6 +1,6 @@
 # BlenderSplitter - Full Recode Blueprint
 
-This document describes the system in implementation detail so the whole codebase can be rebuilt from scratch with the same behavior and stronger reliability.
+This document describes how the add-on currently works in practice: discovery, sync, tile distribution, stitching, and clean-up.
 
 ## 1. Goal and Scope
 
@@ -9,7 +9,7 @@ BlenderSplitter is a distributed tile renderer for Blender:
 - One node acts as `server` (scheduler + stitcher).
 - Multiple nodes act as `workers` (tile render executors).
 - All nodes auto-discover via UDP.
-- Tiles are rendered by region borders and returned to server.
+- Tiles are rendered by region borders and returned to the server.
 - Server writes a run folder containing final image (`master`) and per-tile images (`raw-splits`).
 
 ## 2. Runtime Architecture
@@ -22,7 +22,7 @@ BlenderSplitter is a distributed tile renderer for Blender:
 - `worker.py`
    - Central runtime manager (`DistributedRenderManager`).
    - Role handling (`server`, `worker`, `unassigned`).
-   - Render scheduling, project sync, tile result collection, stitching.
+   - Render scheduling, project sync, tile result collection, stitching, worker clean-up.
 - `network.py`
    - UDP discovery broadcast + responder.
 - `robust_connection.py`
@@ -32,7 +32,7 @@ BlenderSplitter is a distributed tile renderer for Blender:
 - `robust_transfer.py`
    - Chunking and assembly for large tile result payloads.
 - `tiles.py`
-   - Tile generation and overlap calculations.
+   - Tile generation, minimum tile targets, overlap calculations.
 - `stitch.py`
    - Tile compositing into one final image.
 
@@ -55,6 +55,7 @@ BlenderSplitter is a distributed tile renderer for Blender:
 - Render state
    - `pending_jobs`, `completed_jobs`, `job_owner`, `job_attempts`.
    - `current_render_config`, `render_plan`, `expected_jobs`.
+   - `job_queue` and `target_inflight` for load-balanced dispatch.
 - Sync state
    - `sync_active`, `sync_progress`, `project_sync_results`, `sync_total_bytes`.
 - Output state
@@ -107,10 +108,15 @@ Server-side assembler rehydrates these messages into one canonical `tile_result`
 1. Read scene render resolution.
 2. Compute node count:
    - `connected_workers` + optional server if `server_render_tiles` enabled.
-3. Compute grid via `grid_for_worker_count`.
-4. Compute overlap in pixels via `overlap_pixels`.
-5. Build tiles via `generate_tiles`.
-6. Assign tiles round-robin across targets.
+3. Compute tile target:
+   - At least 16 tiles.
+   - Tile counts are rounded up to the next 16 block: 16, 32, 48, ...
+   - `Tile Koeffizient` multiplies the tile target by powers of two: 1, 2, 4, 8, ...
+4. Convert the tile target into a grid that matches the render aspect ratio.
+5. Compute overlap in pixels via `overlap_pixels`.
+6. Build tiles via `generate_tiles`.
+7. Put all tiles into a job queue.
+8. Dispatch jobs to the least loaded worker or `MASTER` as capacity becomes available.
 
 ### 6.2 Worker Tile Render
 
@@ -127,24 +133,28 @@ For each assigned tile:
 - On successful result:
    - write tile PNG into `raw-splits`.
    - append metadata to `completed_jobs`.
+   - immediately dispatch the next queued tile to the same worker if it is still the least-loaded available target.
 - On worker failure/disconnect:
    - increment attempt counter.
    - reassign tile to another worker or `MASTER` until retry limit.
 
 ### 6.4 Finalization
 
-1. Sort completed tiles deterministically by core y/x.
+1. Sort completed tiles deterministically by core Y descending, then core X ascending.
 2. Stitch using `stitch_tiles(...)`.
 3. Write final image into `master` folder.
+
+### 6.5 Clean Worker Blend Flow
+
+The `Clean Worker .blend` button removes synced `.blend` files on every connected worker and then resets the worker to a blank Blender session via `read_factory_settings(use_empty=True)`.
 
 ## 7. Project Sync Pipeline
 
 ### 7.1 Bundle Creation
 
-- Zip project directory from saved `.blend` root.
+- Zip only the saved `.blend` file and Blender-referenced assets such as linked libraries, images, sounds, and movie clips.
 - Exclude transient files (`.git`, `__pycache__`, `.DS_Store`, `.pyc`).
-- Split into parts (default max part size ~512 MB).
-- Compute SHA256 per part.
+- Compute archive metadata and chunk count for the sync UI.
 
 ### 7.2 Transfer
 
@@ -156,7 +166,14 @@ For each assigned tile:
 ### 7.3 Worker Project Activation
 
 - Worker finds received `.blend`.
+- Copies it to a unique worker-named filename to avoid collisions.
 - Schedules load in main thread via queue/timer path.
+
+### 7.4 Worker Clean Reset
+
+- Clean removes the received `.blend` copy.
+- The worker then loads a blank Blender scene.
+- The live render window state is reset so the next render starts cleanly.
 
 ## 8. Filesystem Output Contract
 
@@ -184,12 +201,17 @@ Rules:
 - Run integrity check.
 - Start distributed render.
 - Abort render, kick workers.
+- Clean worker `.blend` files and reset workers to blank state.
 - Tile preview (overlay + generated partition image window).
 
 ### 9.2 Progress Fields
 
 - Sync progress per worker:
-   - current bytes, total bytes, part index, status, speed estimate.
+   - current bytes, total bytes, status, percentage.
+- Sync package metadata:
+   - file count, archive size, source size, chunk count.
+- Worker download progress:
+   - received chunk count and current sync phase.
 - Transfer stats:
    - inline tiles, chunked tiles, chunk messages.
 - Output paths:
@@ -211,7 +233,14 @@ Rules:
 - Validate payload integrity where practical.
 - Avoid oversized single WebSocket messages.
 
-### 10.3 Crash Safety
+### 10.3 Tile Distribution Rules
+
+- Always render at least 16 tiles.
+- Round the tile total up to the next 16 block when more workers are available.
+- Multiply that block target by powers of two when increasing `Tile Koeffizient`.
+- Keep preview and render execution aligned so the UI shows the exact same tile plan.
+
+### 10.4 Crash Safety
 
 - Keep Blender UI operations on main thread.
 - Never run modal redraw loops from background network thread.
@@ -259,7 +288,16 @@ Rules:
 - Large tile forcing chunked return.
 - Discovery race (two machines start simultaneously).
 
-## 13. Build and Packaging
+## 13. Current Behavior Summary
+
+- The server discovers or starts the cluster, then optionally syncs the project to workers.
+- Tile creation uses a minimum of 16 tiles and scales upward in 16-step blocks.
+- `Tile Koeffizient` increases the tile target exponentially, so higher values create more, smaller tiles.
+- Jobs are not fully preassigned; they are queued and distributed according to current worker load.
+- Workers render with border-based crops, return PNGs, and the server stitches them back together.
+- `Clean Worker .blend` deletes synced blend copies and resets each worker to a blank Blender session.
+
+## 14. Build and Packaging
 
 Create add-on archive:
 
@@ -269,7 +307,7 @@ Create add-on archive:
 
 Install ZIP in Blender Preferences -> Add-ons.
 
-## 14. Practical Notes
+## 15. Practical Notes
 
 - Ensure the `.blend` is saved before project sync.
 - Keep all nodes on compatible Blender and add-on versions.

@@ -3,6 +3,7 @@ import json
 MSG_REGISTER_WORKER = "register_worker"
 MSG_REGISTERED = "registered"
 MSG_RENDER_TILE = "render_tile"
+MSG_RENDER_ABORT = "render_abort"
 MSG_TILE_RESULT = "tile_result"
 MSG_TILE_RESULT_START = "tile_result_start"
 MSG_TILE_RESULT_CHUNK = "tile_result_chunk"
