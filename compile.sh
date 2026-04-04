@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+python3 -m py_compile __init__.py network.py robust_connection.py robust_protocol.py robust_transfer.py stitch.py tiles.py worker.py ui.py
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"

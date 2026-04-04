@@ -62,15 +62,40 @@ def generate_tiles(res_x: int, res_y: int, tiles_x: int, tiles_y: int, overlap: 
 
 def collect_render_signature(scene) -> tuple[dict, str]:
     render = scene.render
-    camera_name = scene.camera.name if scene.camera else "none"
+    camera = scene.camera
+    camera_name = camera.name if camera else "none"
+    camera_loc = [0.0, 0.0, 0.0]
+    camera_rot = [0.0, 0.0, 0.0]
+    if camera is not None:
+        try:
+            camera_loc = [round(float(v), 6) for v in camera.location]
+        except Exception:
+            camera_loc = [0.0, 0.0, 0.0]
+        try:
+            camera_rot = [round(float(v), 6) for v in camera.rotation_euler]
+        except Exception:
+            camera_rot = [0.0, 0.0, 0.0]
+
+    cycles_samples = int(getattr(scene.cycles, "samples", 0)) if hasattr(scene, "cycles") else 0
+    cycles_seed = int(getattr(scene.cycles, "seed", 0)) if hasattr(scene, "cycles") else 0
+    eevee_samples = int(getattr(scene.eevee, "taa_render_samples", 0)) if hasattr(scene, "eevee") else 0
+
     payload = {
         "engine": str(render.engine),
         "camera": camera_name,
+        "camera_location": camera_loc,
+        "camera_rotation": camera_rot,
         "resolution_x": int(render.resolution_x),
         "resolution_y": int(render.resolution_y),
         "resolution_percentage": int(render.resolution_percentage),
-        "samples": int(getattr(scene.cycles, "samples", 0)) if hasattr(scene, "cycles") else 0,
+        "pixel_aspect_x": round(float(getattr(render, "pixel_aspect_x", 1.0)), 6),
+        "pixel_aspect_y": round(float(getattr(render, "pixel_aspect_y", 1.0)), 6),
+        "samples": cycles_samples,
+        "seed": cycles_seed,
+        "eevee_samples": eevee_samples,
         "frame": int(scene.frame_current),
+        "frame_start": int(scene.frame_start),
+        "frame_end": int(scene.frame_end),
     }
     sig = hashlib.sha256(str(payload).encode("utf-8")).hexdigest()
     return payload, sig

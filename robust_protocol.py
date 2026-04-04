@@ -11,6 +11,10 @@ MSG_HEARTBEAT = "heartbeat"
 MSG_PING = "ping"
 MSG_INTEGRITY_PROBE = "integrity_probe"
 MSG_INTEGRITY_RESULT = "integrity_probe_result"
+MSG_PROJECT_SYNC_START = "project_sync_start"
+MSG_PROJECT_SYNC_CHUNK = "project_sync_chunk"
+MSG_PROJECT_SYNC_COMPLETE = "project_sync_complete"
+MSG_PROJECT_SYNC_ACK = "project_sync_ack"
 
 
 def dumps(payload: dict) -> str:
