@@ -12,9 +12,54 @@ from gpu_extras.batch import batch_for_shader
 from .tiles import generate_tiles, grid_for_tile_count, tile_target_for_workers, overlap_pixels
 from .worker import manager
 
+ADDON_VERSION = "0.3.0"
+ADDON_DEVELOPER = "DevKiD"
+
 _preview_handler = None
 _camera_border_handler = None
 _ui_refresh_registered = False
+
+
+def _tag_redraw_all(context=None):
+    ctx = context or bpy.context
+    if ctx is None:
+        return
+    wm = ctx.window_manager
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = window.screen
+        if not screen:
+            continue
+        for area in screen.areas:
+            area.tag_redraw()
+
+
+def _sync_runtime_settings(context=None):
+    ctx = context or bpy.context
+    if ctx is None or ctx.scene is None or not hasattr(ctx.scene, "blendersplitter_settings"):
+        return
+
+    scene = ctx.scene
+    cfg = scene.blendersplitter_settings
+
+    manager().configure(
+        cfg.host,
+        cfg.server_port,
+        cfg.discovery_port,
+        cfg.overlap_percent,
+        cfg.max_retries,
+        cfg.auto_sync_project,
+        cfg.show_render_window,
+        cfg.server_render_tiles,
+        cfg.tile_coefficient,
+        cfg.output_dir,
+    )
+    _tag_redraw_all(ctx)
+
+
+def _settings_updated(self, context):
+    _sync_runtime_settings(context)
 
 
 def _ui_refresh_tick():
@@ -585,18 +630,44 @@ class BLENDERSPLITTER_OT_close_partition_image(bpy.types.Operator):
         return {"CANCELLED"}
 
 
-class BLENDERSPLITTER_PG_settings(bpy.types.PropertyGroup):
-    host: bpy.props.StringProperty(name="Host", default="0.0.0.0")
-    server_port: bpy.props.IntProperty(name="Server Port", default=8765, min=1024, max=65535)
-    discovery_port: bpy.props.IntProperty(name="Discovery Port", default=8766, min=1024, max=65535)
-    overlap_percent: bpy.props.FloatProperty(name="Overlap %", default=3.0, min=2.0, max=8.0)
-    worker_count: bpy.props.IntProperty(name="Worker Count", default=4, min=1, max=256)
-    tile_coefficient: bpy.props.IntProperty(name="Tile Koeffizient", default=1, min=1, max=16)
-    max_retries: bpy.props.IntProperty(name="Max Retries", default=3, min=1, max=20)
-    auto_sync_project: bpy.props.BoolProperty(name="Auto Sync Project", default=False)
-    show_render_window: bpy.props.BoolProperty(name="Show Render Window", default=True)
-    server_render_tiles: bpy.props.BoolProperty(name="Server Render Tiles", default=True)
-    output_dir: bpy.props.StringProperty(name="Output Folder", subtype="DIR_PATH", default="")
+class BLENDERSPLITTER_PG_settings_v2(bpy.types.PropertyGroup):
+    host: bpy.props.StringProperty(name="Host", default="0.0.0.0", update=_settings_updated)
+    server_port: bpy.props.IntProperty(name="Server Port", default=8765, min=1024, max=65535, update=_settings_updated)
+    discovery_port: bpy.props.IntProperty(name="Discovery Port", default=8766, min=1024, max=65535, update=_settings_updated)
+    overlap_percent: bpy.props.FloatProperty(name="Overlap %", default=3.0, min=2.0, max=8.0, update=_settings_updated)
+    worker_count: bpy.props.IntProperty(name="Worker Count", default=4, min=1, max=256, update=_settings_updated)
+    tile_coefficient: bpy.props.IntProperty(name="Tile Koeffizient", default=1, min=1, max=16, update=_settings_updated)
+    max_retries: bpy.props.IntProperty(name="Max Retries", default=3, min=1, max=20, update=_settings_updated)
+    auto_sync_project: bpy.props.BoolProperty(name="Auto Sync Project", default=False, update=_settings_updated)
+    show_render_window: bpy.props.BoolProperty(name="Show Render Window", default=True, update=_settings_updated)
+    server_render_tiles: bpy.props.BoolProperty(name="Server Render Tiles", default=True, update=_settings_updated)
+    output_dir: bpy.props.StringProperty(name="Output Folder", subtype="DIR_PATH", default="", update=_settings_updated)
+
+
+class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
+    bl_idname = "blendersplitter.reset_runtime"
+    bl_label = "Reset"
+
+    def execute(self, context):
+        if not manager().reset_runtime(hard=False):
+            self.report({"ERROR"}, manager().last_error or "Reset fehlgeschlagen")
+            return {"CANCELLED"}
+        _sync_runtime_settings(context)
+        self.report({"INFO"}, "Reset ausgeführt")
+        return {"FINISHED"}
+
+
+class BLENDERSPLITTER_OT_hard_reset_runtime(bpy.types.Operator):
+    bl_idname = "blendersplitter.hard_reset_runtime"
+    bl_label = "Hard Reset"
+
+    def execute(self, context):
+        if not manager().reset_runtime(hard=True):
+            self.report({"ERROR"}, manager().last_error or "Hard Reset fehlgeschlagen")
+            return {"CANCELLED"}
+        _sync_runtime_settings(context)
+        self.report({"INFO"}, "Hard Reset ausgeführt")
+        return {"FINISHED"}
 
 
 class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
@@ -612,13 +683,17 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         mgr = manager()
         is_worker = mgr.role == "worker"
 
+        header = layout.box()
+        header.label(text="Blender Splitter")
+        header.label(text=f"Version: {ADDON_VERSION}")
+        header.label(text=f"Entwickler: {ADDON_DEVELOPER}")
+
         layout.label(text="Cluster Configuration")
         layout.prop(cfg, "host")
         layout.prop(cfg, "server_port")
         layout.prop(cfg, "discovery_port")
         layout.prop(cfg, "output_dir")
         layout.prop(cfg, "overlap_percent")
-        layout.prop(cfg, "worker_count")
         layout.prop(cfg, "tile_coefficient")
         layout.prop(cfg, "max_retries")
         layout.prop(cfg, "auto_sync_project")
@@ -646,6 +721,11 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row.enabled = not is_worker
         row.operator("blendersplitter.sync_project_files", icon="FILE_REFRESH")
         row.operator("blendersplitter.clean_worker_blends", icon="TRASH")
+
+        row = layout.row(align=True)
+        row.enabled = not is_worker
+        row.operator("blendersplitter.reset_runtime", icon="LOOP_BACK")
+        row.operator("blendersplitter.hard_reset_runtime", icon="FILE_REFRESH")
 
         row = layout.row()
         row.enabled = not is_worker
@@ -679,7 +759,7 @@ class BLENDERSPLITTER_PT_tile_preview(bpy.types.Panel):
         cfg = context.scene.blendersplitter_settings
         mgr = manager()
 
-        layout.label(text="Preview & Overlap")
+        layout.label(text="Worker Count Preview")
         layout.prop(cfg, "worker_count")
         layout.prop(cfg, "tile_coefficient")
         layout.prop(cfg, "overlap_percent")
@@ -755,7 +835,9 @@ class BLENDERSPLITTER_PT_sync_progress(bpy.types.Panel):
 
 
 CLASSES = (
-    BLENDERSPLITTER_PG_settings,
+    BLENDERSPLITTER_PG_settings_v2,
+    BLENDERSPLITTER_OT_reset_runtime,
+    BLENDERSPLITTER_OT_hard_reset_runtime,
     BLENDERSPLITTER_OT_start_network,
     BLENDERSPLITTER_OT_stop_network,
     BLENDERSPLITTER_OT_start_server,
@@ -777,9 +859,21 @@ CLASSES = (
 
 
 def register():
+    try:
+        if hasattr(bpy.types.Scene, "blendersplitter_settings"):
+            del bpy.types.Scene.blendersplitter_settings
+    except Exception:
+        pass
+
+    for cls in reversed(CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.blendersplitter_settings = bpy.props.PointerProperty(type=BLENDERSPLITTER_PG_settings)
+    bpy.types.Scene.blendersplitter_settings = bpy.props.PointerProperty(type=BLENDERSPLITTER_PG_settings_v2)
 
     global _ui_refresh_registered
     if not _ui_refresh_registered:

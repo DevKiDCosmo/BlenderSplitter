@@ -3,7 +3,7 @@ bl_info = {
     "blender": (5, 1, 0),
     "category": "Render",
     "version": (0, 3, 0),
-    "author": "BlenderSplitter",
+    "author": "DevKiD",
     "description": "Robust distributed tile rendering over WebSocket",
 }
 

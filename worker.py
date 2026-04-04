@@ -33,6 +33,7 @@ from .robust_protocol import (
     MSG_REGISTERED,
     MSG_RENDER_TILE,
     MSG_RENDER_ABORT,
+    MSG_SERVER_TAKEOVER,
     MSG_TILE_RESULT,
     MSG_TILE_RESULT_CHUNK,
     MSG_TILE_RESULT_COMPLETE,
@@ -162,6 +163,7 @@ class DistributedRenderManager:
         self._tile_assembler = TileResultAssembler()
         self._reconnect = ReconnectController(ReconnectPolicy(rediscover_after=3, self_host_after=8, max_sleep=3.0))
         self._worker_render_view_opened = False
+        self._takeover_requested = False
 
     def configure(
         self,
@@ -186,6 +188,49 @@ class DistributedRenderManager:
         self.server_render_tiles = bool(server_render_tiles)
         self.tile_coefficient = max(1, int(tile_coefficient))
         self.output_dir = bpy.path.abspath(output_dir) if output_dir else ""
+
+    def _sync_runtime_config_from_scene(self, scene=None):
+        scene = scene or _safe_scene()
+        if scene is None or not hasattr(scene, "blendersplitter_settings"):
+            return
+
+        cfg = scene.blendersplitter_settings
+        self.configure(
+            cfg.host,
+            cfg.server_port,
+            cfg.discovery_port,
+            cfg.overlap_percent,
+            cfg.max_retries,
+            cfg.auto_sync_project,
+            cfg.show_render_window,
+            cfg.server_render_tiles,
+            cfg.tile_coefficient,
+            cfg.output_dir,
+        )
+
+    def _clear_sync_artifacts(self):
+        paths = []
+        if self.received_project_dir:
+            paths.append(self.received_project_dir)
+        if self.pending_project_load:
+            paths.append(os.path.dirname(self.pending_project_load))
+
+        for path in paths:
+            if not path:
+                continue
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        self.received_project_dir = ""
+        self.pending_project_load = None
+        self.pending_project_load_attempts = 0
+        self.pending_project_load_retry_at = 0.0
+        self.pending_sync_context = None
 
     def start(self):
         if self.started:
@@ -227,6 +272,7 @@ class DistributedRenderManager:
             self.status = self.last_error
             return False
         try:
+            self._takeover_requested = True
             fut = asyncio.run_coroutine_threadsafe(self._force_server_async(), self._loop)
             _ = fut.result(timeout=8.0)
             return True
@@ -237,6 +283,19 @@ class DistributedRenderManager:
 
     async def _force_server_async(self):
         if self._worker_socket is not None:
+            try:
+                await self._worker_socket.send(
+                    json_dumps(
+                        {
+                            "type": MSG_SERVER_TAKEOVER,
+                            "worker_id": self.node_id,
+                            "new_host": _local_ip(),
+                            "new_port": self.server_port,
+                        }
+                    )
+                )
+            except Exception:
+                pass
             try:
                 await self._worker_socket.close()
             except Exception:
@@ -594,6 +653,9 @@ class DistributedRenderManager:
                         msg = json.loads(raw)
                         await self._handle_worker_message(ws, msg)
             except Exception as exc:
+                if self._takeover_requested:
+                    self._takeover_requested = False
+                    return
                 err = str(exc)
                 self.last_error = err
                 self._reconnect.on_failure()
@@ -618,6 +680,10 @@ class DistributedRenderManager:
 
                 await asyncio.sleep(self._reconnect.sleep_seconds())
 
+            if self._takeover_requested:
+                self._takeover_requested = False
+                return
+
     async def _handle_worker_socket(self, websocket):
         worker_id = None
         try:
@@ -637,6 +703,17 @@ class DistributedRenderManager:
                     await websocket.send(json_dumps({"type": MSG_REGISTERED, "node_id": worker_id}))
                     self.status = f"Worker verbunden: {len(self.connected_workers)}"
                     continue
+
+                if msg_type == MSG_SERVER_TAKEOVER:
+                    if worker_id and worker_id in self.connected_workers:
+                        self._reassign_jobs_from_worker(worker_id)
+                        self.connected_workers.pop(worker_id, None)
+                    try:
+                        await websocket.close()
+                    except Exception:
+                        pass
+                    self.status = "Worker per Force Server freigegeben"
+                    return
 
                 if msg_type in (MSG_TILE_RESULT, MSG_TILE_RESULT_START, MSG_TILE_RESULT_CHUNK, MSG_TILE_RESULT_COMPLETE):
                     assembled = self._tile_assembler.handle(msg)
@@ -1002,16 +1079,24 @@ class DistributedRenderManager:
         asyncio.run_coroutine_threadsafe(_send(), self._loop)
 
     def _prepare_output_dirs(self, output_file):
-        base = self.output_dir.strip() if self.output_dir else ""
+        base = bpy.path.abspath(self.output_dir).strip() if self.output_dir else ""
         if not base:
-            base = os.path.dirname(output_file) if output_file else tempfile.gettempdir()
+            base = os.path.dirname(os.path.abspath(output_file)) if output_file else tempfile.gettempdir()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         run_root = os.path.join(base, f"blendersplitter_{timestamp}")
         self.current_output_root = run_root
         self.current_master_dir = os.path.join(run_root, "master")
         self.current_raw_splits_dir = os.path.join(run_root, "raw-splits")
-        os.makedirs(self.current_master_dir, exist_ok=True)
-        os.makedirs(self.current_raw_splits_dir, exist_ok=True)
+        try:
+            os.makedirs(self.current_master_dir, exist_ok=True)
+            os.makedirs(self.current_raw_splits_dir, exist_ok=True)
+        except Exception:
+            fallback_root = os.path.join(tempfile.gettempdir(), f"blendersplitter_{timestamp}")
+            self.current_output_root = fallback_root
+            self.current_master_dir = os.path.join(fallback_root, "master")
+            self.current_raw_splits_dir = os.path.join(fallback_root, "raw-splits")
+            os.makedirs(self.current_master_dir, exist_ok=True)
+            os.makedirs(self.current_raw_splits_dir, exist_ok=True)
 
     def _build_project_bundle(self):
         blend_path = bpy.data.filepath
@@ -1202,7 +1287,7 @@ class DistributedRenderManager:
             return False
 
         async def _send():
-            for wid, info in list(self.connected_workers.items()):
+            for _, info in list(self.connected_workers.items()):
                 ws = info.get("socket")
                 if ws is None:
                     continue
@@ -1224,6 +1309,8 @@ class DistributedRenderManager:
         total_chunks = int(transfer.get("total_chunks", 0))
         if total_chunks <= 0:
             raise RuntimeError("Ungültige Chunk-Anzahl")
+
+        self._clear_sync_artifacts()
 
         ordered = []
         for idx in range(total_chunks):
@@ -1296,6 +1383,8 @@ class DistributedRenderManager:
             self.last_error = "Keine aktive Szene"
             self.status = self.last_error
             return False
+
+        self._sync_runtime_config_from_scene(scene)
 
         if self.show_render_window:
             self._open_live_render_view()
@@ -1456,6 +1545,10 @@ class DistributedRenderManager:
             if not self.force_start_server():
                 self.last_error = self.status
                 return False
+
+        scene = _safe_scene()
+        if scene is not None:
+            self._sync_runtime_config_from_scene(scene)
 
         workers = list(self.connected_workers.keys())
         if not workers:
@@ -1724,6 +1817,74 @@ class DistributedRenderManager:
                 asyncio.run_coroutine_threadsafe(_broadcast_abort(), self._loop)
             except Exception:
                 pass
+        return True
+
+    def reset_runtime(self, hard=False):
+        self.last_error = ""
+        self.status = "Idle"
+        self.last_integrity = "n/a"
+        self.last_duration_seconds = 0.0
+        self.render_abort_requested = False
+        self._takeover_requested = False
+        self.sync_active = False
+        self.sync_progress = {}
+        self.sync_total_bytes = 0
+        self.sync_start_time = 0.0
+        self.incoming_project_progress = {}
+        self.project_sync_results = {}
+        self.integrity_probe_results = {}
+        self.sync_package_info = {}
+        self.worker_sync_state = {}
+        self.pending_jobs.clear()
+        self.completed_jobs.clear()
+        self.job_owner.clear()
+        self.job_attempts.clear()
+        self.job_queue = []
+        self.target_inflight = {}
+        self.target_ready_at = {}
+        self.dispatch_targets = []
+        self.render_plan = []
+        self.expected_jobs = 0
+        self.current_render_config = None
+        self.current_render_output = ""
+        self.render_start_time = 0.0
+        self._incoming_project = None
+        self._clear_sync_artifacts()
+        self.current_output_root = ""
+        self.current_master_dir = ""
+        self.current_raw_splits_dir = ""
+        self.transfer_stats = {
+            "tiles_inline": 0,
+            "tiles_chunked": 0,
+            "chunk_messages": 0,
+        }
+
+        if hard:
+            scene = _safe_scene()
+            if scene is not None and hasattr(scene, "blendersplitter_settings"):
+                cfg = scene.blendersplitter_settings
+                try:
+                    cfg.output_dir = ""
+                    cfg.tile_coefficient = 1
+                    cfg.overlap_percent = 3.0
+                    cfg.max_retries = 3
+                    cfg.auto_sync_project = False
+                    cfg.show_render_window = True
+                    cfg.server_render_tiles = True
+                except Exception:
+                    pass
+
+            self.output_dir = ""
+            self.tile_coefficient = 1
+            self.overlap_percent = 3.0
+            self.max_retries = 3
+            self.auto_sync_project = False
+            self.show_render_window = True
+            self.server_render_tiles = True
+            self.status = "Hard Reset ausgeführt"
+        else:
+            self.status = "Reset ausgeführt"
+
         return True
 
     def kick_all_workers(self):
