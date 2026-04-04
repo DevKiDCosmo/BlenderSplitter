@@ -1,0 +1,22 @@
+schema_version = "1.0.0"
+
+id = "dist_tile_render"
+version = "0.3.0"
+name = "Distributed Tile Rendering"
+tagline = "A Blender add-on for distributed tile rendering across multiple machines."
+maintainer = "DevKiD"
+type = "add-on"
+
+blender_version_min = "4.5.0"
+# blender_version_max = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+copyright = ["2026 DevKiD", "2026 Duy Nam Schlitz"]
+
+[dependencies]
+# No external dependencies for the add-on itself, but requires Pillow for tile stitching which is bundled
+
+[permissions]
+network = "Client and server socket communication for coordinating distributed rendering tasks."
+filesystem = "Read and write access to project files, temporary render tiles, and logs for managing the distributed rendering process."

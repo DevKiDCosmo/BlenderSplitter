@@ -36,6 +36,7 @@ from .robust_protocol import (
     MSG_TILE_RESULT_CHUNK,
     MSG_TILE_RESULT_COMPLETE,
     MSG_TILE_RESULT_START,
+    MSG_CLEAN_BLEND,
 )
 from .robust_transfer import ChunkConfig, TileResultAssembler, TileResultChunker
 from .stitch import stitch_tiles
@@ -641,6 +642,38 @@ class DistributedRenderManager:
     async def _handle_worker_message(self, websocket, msg):
         msg_type = msg.get("type")
 
+        if msg_type == MSG_CLEAN_BLEND:
+            # Server requested worker to remove any received .blend copies
+            deleted = 0
+            try:
+                if self.received_project_dir and os.path.exists(self.received_project_dir):
+                    for root, _, files in os.walk(self.received_project_dir):
+                        for fn in files:
+                            if fn.lower().endswith(".blend"):
+                                p = os.path.join(root, fn)
+                                try:
+                                    os.remove(p)
+                                    deleted += 1
+                                except Exception:
+                                    pass
+
+                if self.pending_project_load and os.path.exists(self.pending_project_load):
+                    try:
+                        os.remove(self.pending_project_load)
+                        deleted += 1
+                    except Exception:
+                        pass
+
+                # clear state
+                self.received_project_dir = ""
+                self.pending_project_load = None
+                self.pending_sync_context = None
+                self.status = f"Cleaned {deleted} blend(s)"
+            except Exception as exc:
+                self.last_error = f"Clean failed: {exc}"
+                self.status = self.last_error
+            return
+
         if msg_type == MSG_REGISTERED:
             self.status = "Worker registriert"
             return
@@ -1103,6 +1136,29 @@ class DistributedRenderManager:
 
         self.status = f"Projekt-Sync OK: {len(workers)} Worker"
         return True
+
+    def clean_worker_blends(self):
+        """Ask all connected workers to delete received .blend copies."""
+        if self._loop is None:
+            self.last_error = "Event loop nicht verfügbar"
+            return False
+
+        async def _send():
+            for wid, info in list(self.connected_workers.items()):
+                ws = info.get("socket")
+                if ws is None:
+                    continue
+                try:
+                    await ws.send(json_dumps({"type": MSG_CLEAN_BLEND}))
+                except Exception:
+                    pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), self._loop)
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
 
     def _apply_received_project_bundle(self, transfer):
         transfer_id = transfer.get("transfer_id")

@@ -444,6 +444,19 @@ class BLENDERSPLITTER_OT_kick_all(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BLENDERSPLITTER_OT_clean_worker_blends(bpy.types.Operator):
+    bl_idname = "blendersplitter.clean_worker_blends"
+    bl_label = "Clean Worker .blend"
+
+    def execute(self, context):
+        ok = manager().clean_worker_blends()
+        if not ok:
+            self.report({"ERROR"}, manager().last_error or "Clean fehlgeschlagen")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Clean-Befehl an Worker gesendet")
+        return {"FINISHED"}
+
+
 class BLENDERSPLITTER_OT_toggle_preview_overlay(bpy.types.Operator):
     bl_idname = "blendersplitter.toggle_preview_overlay"
     bl_label = "Toggle Preview Overlay"
@@ -620,6 +633,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row = layout.row()
         row.enabled = not is_worker
         row.operator("blendersplitter.sync_project_files", icon="FILE_REFRESH")
+        row.operator("blendersplitter.clean_worker_blends", icon="TRASH")
 
         row = layout.row()
         row.enabled = not is_worker
@@ -734,6 +748,7 @@ CLASSES = (
     BLENDERSPLITTER_OT_start_server,
     BLENDERSPLITTER_OT_cluster_monitor_popup,
     BLENDERSPLITTER_OT_install_requirements,
+    BLENDERSPLITTER_OT_clean_worker_blends,
     BLENDERSPLITTER_OT_sync_project_files,
     BLENDERSPLITTER_OT_dry_run_integrity,
     BLENDERSPLITTER_OT_distributed_render,

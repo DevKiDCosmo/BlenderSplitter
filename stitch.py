@@ -7,10 +7,13 @@ def stitch_tiles(tile_results: list[dict], width: int, height: int, output_path:
 
     base = Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
+    # Sort rows top->bottom then left->right. Use descending Y so
+    # tiles that lie visually on top (higher Y in Blender coordinate
+    # space) are composed after lower ones when overlaps exist.
     ordered = sorted(
         tile_results,
         key=lambda t: (
-            int(t.get("core_min_y", t.get("min_y", 0))),
+            -int(t.get("core_min_y", t.get("min_y", 0))),
             int(t.get("core_min_x", t.get("min_x", 0))),
             str(t.get("tile_id", "")),
         ),

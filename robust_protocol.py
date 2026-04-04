@@ -16,6 +16,8 @@ MSG_PROJECT_SYNC_CHUNK = "project_sync_chunk"
 MSG_PROJECT_SYNC_COMPLETE = "project_sync_complete"
 MSG_PROJECT_SYNC_ACK = "project_sync_ack"
 
+MSG_CLEAN_BLEND = "clean_blend"
+
 
 def dumps(payload: dict) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
