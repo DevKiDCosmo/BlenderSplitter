@@ -103,14 +103,38 @@ class TileResultAssembler:
             entry = self._incoming.pop(transfer_id, None)
             if entry is None:
                 return None
-            ordered = [entry["chunks"].get(i, "") for i in range(entry["total_chunks"])]
+            raw_parts = []
+            for i in range(entry["total_chunks"]):
+                chunk_b64 = entry["chunks"].get(i)
+                if chunk_b64 is None:
+                    return {
+                        "type": MSG_TILE_RESULT,
+                        "tile_id": entry.get("tile_id"),
+                        "worker_id": entry.get("worker_id"),
+                        "tile": entry.get("tile"),
+                        "ok": False,
+                        "error": f"Chunk fehlt: {i}",
+                    }
+                try:
+                    raw_parts.append(base64.b64decode(chunk_b64))
+                except Exception:
+                    return {
+                        "type": MSG_TILE_RESULT,
+                        "tile_id": entry.get("tile_id"),
+                        "worker_id": entry.get("worker_id"),
+                        "tile": entry.get("tile"),
+                        "ok": False,
+                        "error": f"Chunk dekodierung fehlgeschlagen: {i}",
+                    }
+
+            raw = b"".join(raw_parts)
             return {
                 "type": MSG_TILE_RESULT,
                 "tile_id": entry.get("tile_id"),
                 "worker_id": entry.get("worker_id"),
                 "tile": entry.get("tile"),
                 "ok": bool(msg.get("ok", True)),
-                "png_base64": "".join(ordered),
+                "png_base64": base64.b64encode(raw).decode("ascii"),
             }
 
         return None

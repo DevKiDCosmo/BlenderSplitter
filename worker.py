@@ -147,6 +147,7 @@ class DistributedRenderManager:
         self._tile_chunker = TileResultChunker(ChunkConfig(chunk_size=512 * 1024, inline_limit=1024 * 1024))
         self._tile_assembler = TileResultAssembler()
         self._reconnect = ReconnectController(ReconnectPolicy(rediscover_after=3, self_host_after=8, max_sleep=3.0))
+        self._worker_render_view_opened = False
 
     def configure(
         self,
@@ -498,8 +499,8 @@ class DistributedRenderManager:
             self._handle_worker_socket,
             "0.0.0.0",
             self.server_port,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=30,
+            ping_timeout=300,
             max_size=None,
         )
         self._discovery = DiscoveryResponder(self.discovery_port, self.server_port)
@@ -515,7 +516,7 @@ class DistributedRenderManager:
 
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(url, ping_interval=60, ping_timeout=120, max_size=None, open_timeout=5) as ws:
+                async with websockets.connect(url, ping_interval=30, ping_timeout=300, max_size=None, open_timeout=10) as ws:
                     self._reconnect.reset()
                     self._worker_socket = ws
                     self.server_host = host
@@ -764,7 +765,8 @@ class DistributedRenderManager:
 
         self.last_integrity = "ok"
         tile = payload["tile"]
-        self._open_worker_render_view(tile)
+        if self.show_render_window:
+            self._open_worker_render_view(tile)
         out_path = self._render_tile_to_path(scene, tile)
 
         with open(out_path, "rb") as fh:
@@ -780,25 +782,46 @@ class DistributedRenderManager:
         }
 
     def _open_worker_render_view(self, tile):
+        self.status = f"Worker rendert Tile {tile.get('id')}"
+
+        # Try to keep one persistent live view instead of spawning windows per tile.
+        if self._worker_render_view_opened:
+            self._bind_render_result_to_image_editors()
+            return
+
         try:
             bpy.ops.render.view_show("INVOKE_DEFAULT")
-            self.status = f"Worker rendert Tile {tile.get('id')}"
+            self._worker_render_view_opened = True
+            self._bind_render_result_to_image_editors()
             return
         except Exception:
             pass
 
         try:
             bpy.ops.wm.window_new()
-            wm = bpy.context.window_manager
-            new_window = wm.windows[-1] if wm.windows else None
-            if new_window and new_window.screen and new_window.screen.areas:
-                area = new_window.screen.areas[0]
-                area.type = "IMAGE_EDITOR"
-                if "Render Result" in bpy.data.images:
-                    area.spaces.active.image = bpy.data.images["Render Result"]
-            self.status = f"Worker rendert Tile {tile.get('id')}"
+            self._worker_render_view_opened = True
+            self._bind_render_result_to_image_editors()
+            return
         except Exception:
-            self.status = f"Worker rendert Tile {tile.get('id')}"
+            pass
+
+    def _bind_render_result_to_image_editors(self):
+        img = bpy.data.images.get("Render Result")
+        if img is None or bpy.context is None:
+            return
+        wm = bpy.context.window_manager
+        if wm is None:
+            return
+        for window in wm.windows:
+            screen = window.screen
+            if not screen:
+                continue
+            for area in screen.areas:
+                if area.type == "IMAGE_EDITOR":
+                    try:
+                        area.spaces.active.image = img
+                    except Exception:
+                        pass
 
     def _render_tile_to_path(self, scene, tile):
         render = scene.render
@@ -1191,17 +1214,39 @@ class DistributedRenderManager:
         self.expected_jobs = len(tiles)
         self.render_start_time = time.time()
 
-        targets = []
+        targets = list(workers)
         if self.server_render_tiles:
             targets.append("MASTER")
-        targets.extend(workers)
+        if not workers and self.server_render_tiles:
+            targets = ["MASTER"]
         if not targets:
             self.last_error = "Keine Ziele verfügbar"
             self.status = self.last_error
             return False
 
+        # Fair quotas: all nodes get almost equal work; extra tiles go to workers first.
+        base_count = len(tiles) // len(targets)
+        remainder = len(tiles) % len(targets)
+        quota = {target: base_count for target in targets}
+        remainder_priority = [target for target in targets if target != "MASTER"]
+        if "MASTER" in targets:
+            remainder_priority.append("MASTER")
+        for target in remainder_priority[:remainder]:
+            quota[target] += 1
+
+        dispatch_targets = []
+        used = {target: 0 for target in targets}
+        cursor = 0
+        while len(dispatch_targets) < len(tiles):
+            target = targets[cursor % len(targets)]
+            cursor += 1
+            if used[target] >= quota[target]:
+                continue
+            dispatch_targets.append(target)
+            used[target] += 1
+
         for idx, tile in enumerate(tiles):
-            target = targets[idx % len(targets)]
+            target = dispatch_targets[idx]
             job = {
                 "type": MSG_RENDER_TILE,
                 "tile_id": tile["id"],
@@ -1298,7 +1343,16 @@ class DistributedRenderManager:
             return
 
         tile = message.get("tile") or {}
-        png_data = base64.b64decode(message.get("png_base64", ""))
+        try:
+            png_data = base64.b64decode(message.get("png_base64", ""))
+        except Exception:
+            self._reassign_tile(tile_id, "PNG Base64 dekodierung fehlgeschlagen")
+            return
+
+        # Fast PNG integrity guard to avoid stitch-time truncation crashes.
+        if len(png_data) < 16 or not png_data.startswith(b"\x89PNG\r\n\x1a\n") or b"IEND" not in png_data[-64:]:
+            self._reassign_tile(tile_id, "PNG unvollständig oder beschädigt")
+            return
         worker_name = str(message.get("worker_id") or "unknown")
         worker_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in worker_name)[:24] or "unknown"
 
