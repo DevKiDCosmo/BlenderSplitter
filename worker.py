@@ -1013,42 +1013,6 @@ class DistributedRenderManager:
         os.makedirs(self.current_master_dir, exist_ok=True)
         os.makedirs(self.current_raw_splits_dir, exist_ok=True)
 
-    def _show_final_image_in_editor(self, output_path):
-        try:
-            if bpy.context is None:
-                return
-            image = bpy.data.images.load(output_path, check_existing=True)
-            wm = bpy.context.window_manager
-            if wm is None:
-                return
-
-            target_window = None
-            for window in wm.windows:
-                screen = window.screen
-                if not screen:
-                    continue
-                for area in screen.areas:
-                    if area.type == "IMAGE_EDITOR":
-                        target_window = window
-                        try:
-                            area.spaces.active.image = image
-                        except Exception:
-                            pass
-                        return
-
-            if wm.windows:
-                target_window = wm.windows[0]
-                screen = target_window.screen
-                if screen and screen.areas:
-                    area = screen.areas[0]
-                    area.type = "IMAGE_EDITOR"
-                    try:
-                        area.spaces.active.image = image
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
     def _build_project_bundle(self):
         blend_path = bpy.data.filepath
         if not blend_path:
@@ -1327,23 +1291,7 @@ class DistributedRenderManager:
                 self.last_error = self.status
                 return False
 
-        # Refresh runtime settings from the current UI so Output Folder changes apply immediately.
         scene = _safe_scene()
-        if scene is not None and hasattr(scene, "blendersplitter_settings"):
-            cfg = scene.blendersplitter_settings
-            self.configure(
-                cfg.host,
-                cfg.server_port,
-                cfg.discovery_port,
-                cfg.overlap_percent,
-                cfg.max_retries,
-                cfg.auto_sync_project,
-                cfg.show_render_window,
-                cfg.server_render_tiles,
-                cfg.tile_coefficient,
-                cfg.output_dir,
-            )
-
         if scene is None:
             self.last_error = "Keine aktive Szene"
             self.status = self.last_error
@@ -1634,7 +1582,6 @@ class DistributedRenderManager:
             self.last_duration_seconds = time.time() - self.render_start_time
             self.last_integrity = "ok"
             self.status = f"Render abgeschlossen in {self.last_duration_seconds:.2f}s"
-            self._show_final_image_in_editor(self.current_render_output)
         except Exception as exc:
             self.last_error = f"Stitch fehlgeschlagen: {exc}"
             self.status = self.last_error
