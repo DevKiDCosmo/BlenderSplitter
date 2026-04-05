@@ -15,6 +15,7 @@ import traceback
 import uuid
 import zipfile
 import shutil
+from pathlib import Path
 
 import bpy
 
@@ -39,6 +40,7 @@ from .robust_protocol import (
     MSG_TILE_RESULT_COMPLETE,
     MSG_TILE_RESULT_START,
     MSG_CLEAN_BLEND,
+    MSG_CLEAN_BLEND_ACK,
 )
 from .robust_transfer import ChunkConfig, TileResultAssembler, TileResultChunker
 from .stitch import stitch_tiles
@@ -98,6 +100,14 @@ class DistributedRenderManager:
         self.server_render_tiles = True
         self.tile_coefficient = 1
         self.output_dir = ""
+        self.startup_mode = "user"
+        self.user_mode = "master_worker"
+        self.always_flags = set()
+        self.external_scheduler_enabled = False
+        self.external_scheduler_script = "scheduler_app.py"
+        self.external_scheduler_host = "127.0.0.1"
+        self.external_scheduler_port = 9876
+        self.external_scheduler_process = None
 
         self.connected_workers = {}
         self.pending_jobs = {}
@@ -138,6 +148,7 @@ class DistributedRenderManager:
         self._incoming_project = None
         self.sync_package_info = {}
         self.worker_sync_state = {}
+        self.clean_results = {}
 
         self.transfer_stats = {
             "tiles_inline": 0,
@@ -189,6 +200,67 @@ class DistributedRenderManager:
         self.tile_coefficient = max(1, int(tile_coefficient))
         self.output_dir = bpy.path.abspath(output_dir) if output_dir else ""
 
+    def configure_runtime_modes(self, startup_mode="user", user_mode="master_worker", always_flags=None):
+        valid = {"worker", "master", "master_worker", "user"}
+        mode = str(startup_mode or "user").strip().lower()
+        fallback_user_mode = str(user_mode or "master_worker").strip().lower()
+        if mode not in valid:
+            mode = "user"
+        if fallback_user_mode not in {"worker", "master", "master_worker"}:
+            fallback_user_mode = "master_worker"
+        self.startup_mode = mode
+        self.user_mode = fallback_user_mode
+        raw_flags = always_flags or []
+        self.always_flags = {str(flag).strip().upper() for flag in raw_flags if str(flag).strip()}
+
+    def configure_external_scheduler(self, enabled=False, script="scheduler_app.py", host="127.0.0.1", port=9876):
+        self.external_scheduler_enabled = bool(enabled)
+        self.external_scheduler_script = str(script or "scheduler_app.py")
+        self.external_scheduler_host = str(host or "127.0.0.1")
+        self.external_scheduler_port = int(port or 9876)
+
+    def effective_mode(self):
+        if self.startup_mode == "user":
+            return self.user_mode
+        return self.startup_mode
+
+    def start_external_scheduler(self, config_path):
+        if not self.external_scheduler_enabled:
+            return False
+        if self.external_scheduler_process is not None and self.external_scheduler_process.poll() is None:
+            return True
+
+        script_path = Path(self.external_scheduler_script)
+        if not script_path.is_absolute():
+            script_path = Path(__file__).resolve().parent / script_path
+        if not script_path.exists():
+            self.last_error = f"Scheduler script not found: {script_path}"
+            self.status = self.last_error
+            return False
+
+        try:
+            self.external_scheduler_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--config",
+                    str(config_path),
+                    "--host",
+                    self.external_scheduler_host,
+                    "--port",
+                    str(self.external_scheduler_port),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.status = f"External scheduler started on {self.external_scheduler_host}:{self.external_scheduler_port}"
+            return True
+        except Exception as exc:
+            self.last_error = f"Failed to start external scheduler: {exc}"
+            self.status = self.last_error
+            return False
+
     def _sync_runtime_config_from_scene(self, scene=None):
         scene = scene or _safe_scene()
         if scene is None or not hasattr(scene, "blendersplitter_settings"):
@@ -237,14 +309,14 @@ class DistributedRenderManager:
             return
 
         if websockets is None:
-            self.status = "websockets fehlt, versuche Installation"
+            self.status = "websockets missing, trying installation"
             if not self.auto_install_requirements(only_modules=["websockets"]):
                 if not _load_websockets_module():
-                    self.last_error = "websockets nicht verfügbar"
+                    self.last_error = "websockets not available"
                     self.status = self.last_error
                     return
             if not _load_websockets_module():
-                self.last_error = "websockets konnte nicht geladen werden"
+                self.last_error = "websockets could not be loaded"
                 self.status = self.last_error
                 return
 
@@ -552,16 +624,42 @@ class DistributedRenderManager:
         await self._shutdown_async()
 
     async def _auto_connect_or_host(self):
-        self.status = "Suche Server..."
+        mode = self.effective_mode()
+        self.status = f"Mode: {mode}"
+
+        if mode == "master":
+            self.status = "Mode master: starting local server"
+            await self._start_server()
+            return
+
+        if mode == "master_worker":
+            self.status = "Mode master_worker: starting local server"
+            await self._start_server()
+            return
+
+        if mode == "worker":
+            self.status = "Mode worker: searching for server"
+            while not self._stop_event.is_set():
+                found = discover_server(self.discovery_port, timeout=1.5)
+                if found:
+                    host, port = found
+                    self.role = "worker"
+                    self.status = f"Server found: {host}:{port}"
+                    await self._connect_as_worker(host, port)
+                    return
+                await asyncio.sleep(0.8)
+            return
+
+        self.status = "Searching server..."
         for attempt in range(6):
             found = discover_server(self.discovery_port, timeout=1.5)
             if found:
                 host, port = found
                 self.role = "worker"
-                self.status = f"Server gefunden: {host}:{port}"
+                self.status = f"Server found: {host}:{port}"
                 await self._connect_as_worker(host, port)
                 return
-            self.status = f"Suche Server ({attempt + 1}/6)"
+            self.status = f"Searching server ({attempt + 1}/6)"
             await asyncio.sleep(0.5 + random.random() * 0.4)
 
         await asyncio.sleep(0.4 + random.random() * 1.2)
@@ -569,11 +667,11 @@ class DistributedRenderManager:
         if found:
             host, port = found
             self.role = "worker"
-            self.status = f"Spät gefunden: {host}:{port}"
+            self.status = f"Late server found: {host}:{port}"
             await self._connect_as_worker(host, port)
             return
 
-        self.status = "Kein Server gefunden, starte lokal"
+        self.status = "No server found, starting local"
         await self._start_server()
 
     async def _shutdown_async(self):
@@ -701,7 +799,7 @@ class DistributedRenderManager:
                         "app": msg.get("app", "unknown"),
                     }
                     await websocket.send(json_dumps({"type": MSG_REGISTERED, "node_id": worker_id}))
-                    self.status = f"Worker verbunden: {len(self.connected_workers)}"
+                    self.status = f"Worker connected: {len(self.connected_workers)}"
                     continue
 
                 if msg_type == MSG_SERVER_TAKEOVER:
@@ -712,8 +810,18 @@ class DistributedRenderManager:
                         await websocket.close()
                     except Exception:
                         pass
-                    self.status = "Worker per Force Server freigegeben"
+                    self.status = "Worker released by force server"
                     return
+
+                if msg_type == MSG_CLEAN_BLEND_ACK:
+                    worker_key = msg.get("worker_id") or worker_id
+                    if worker_key:
+                        self.clean_results[worker_key] = {
+                            "ok": bool(msg.get("ok", True)),
+                            "deleted": int(msg.get("deleted", 0)),
+                            "error": msg.get("error", ""),
+                        }
+                    continue
 
                 if msg_type in (MSG_TILE_RESULT, MSG_TILE_RESULT_START, MSG_TILE_RESULT_CHUNK, MSG_TILE_RESULT_COMPLETE):
                     assembled = self._tile_assembler.handle(msg)
@@ -748,7 +856,7 @@ class DistributedRenderManager:
             if worker_id and worker_id in self.connected_workers:
                 self._reassign_jobs_from_worker(worker_id)
                 del self.connected_workers[worker_id]
-                self.status = f"Worker getrennt: {len(self.connected_workers)}"
+                self.status = f"Worker disconnected: {len(self.connected_workers)}"
 
     async def _handle_worker_message(self, websocket, msg):
         msg_type = msg.get("type")
@@ -785,9 +893,30 @@ class DistributedRenderManager:
                 self.pending_blank_reset_retry_at = 0.0
                 self.pending_sync_context = None
                 self.status = f"Cleaned {deleted} blend(s)"
+                await websocket.send(
+                    json_dumps(
+                        {
+                            "type": MSG_CLEAN_BLEND_ACK,
+                            "worker_id": self.node_id,
+                            "ok": True,
+                            "deleted": deleted,
+                        }
+                    )
+                )
             except Exception as exc:
                 self.last_error = f"Clean failed: {exc}"
                 self.status = self.last_error
+                await websocket.send(
+                    json_dumps(
+                        {
+                            "type": MSG_CLEAN_BLEND_ACK,
+                            "worker_id": self.node_id,
+                            "ok": False,
+                            "deleted": deleted,
+                            "error": str(exc),
+                        }
+                    )
+                )
             return
 
         if msg_type == MSG_REGISTERED:
@@ -1283,8 +1412,15 @@ class DistributedRenderManager:
     def clean_worker_blends(self):
         """Ask all connected workers to delete received .blend copies."""
         if self._loop is None:
-            self.last_error = "Event loop nicht verfügbar"
+            self.last_error = "Event loop not available"
             return False
+
+        workers = list(self.connected_workers.keys())
+        if not workers:
+            self.status = "No workers connected"
+            return False
+
+        self.clean_results = {}
 
         async def _send():
             for _, info in list(self.connected_workers.items()):
@@ -1298,6 +1434,24 @@ class DistributedRenderManager:
 
         try:
             asyncio.run_coroutine_threadsafe(_send(), self._loop)
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if len(self.clean_results) >= len(workers):
+                    break
+                time.sleep(0.1)
+
+            missing = [wid for wid in workers if wid not in self.clean_results]
+            for wid in missing:
+                self.clean_results[wid] = {"ok": False, "deleted": 0, "error": "ack timeout"}
+
+            failed = [wid for wid, item in self.clean_results.items() if not item.get("ok")]
+            if failed:
+                self.status = f"Clean finished with failures: {len(failed)}/{len(workers)}"
+                self.last_error = "; ".join(f"{wid}: {self.clean_results[wid].get('error', '')}" for wid in failed)
+                return False
+
+            total_deleted = sum(int(item.get("deleted", 0)) for item in self.clean_results.values())
+            self.status = f"Clean finished: deleted {total_deleted} blend file(s)"
             return True
         except Exception as exc:
             self.last_error = str(exc)

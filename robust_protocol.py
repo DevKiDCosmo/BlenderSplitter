@@ -19,6 +19,7 @@ MSG_PROJECT_SYNC_COMPLETE = "project_sync_complete"
 MSG_PROJECT_SYNC_ACK = "project_sync_ack"
 
 MSG_CLEAN_BLEND = "clean_blend"
+MSG_CLEAN_BLEND_ACK = "clean_blend_ack"
 
 
 def dumps(payload: dict) -> str:

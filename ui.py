@@ -650,10 +650,10 @@ class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
 
     def execute(self, context):
         if not manager().reset_runtime(hard=False):
-            self.report({"ERROR"}, manager().last_error or "Reset fehlgeschlagen")
+            self.report({"ERROR"}, manager().last_error or "Reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Reset ausgeführt")
+        self.report({"INFO"}, "Reset completed")
         return {"FINISHED"}
 
 
@@ -663,10 +663,10 @@ class BLENDERSPLITTER_OT_hard_reset_runtime(bpy.types.Operator):
 
     def execute(self, context):
         if not manager().reset_runtime(hard=True):
-            self.report({"ERROR"}, manager().last_error or "Hard Reset fehlgeschlagen")
+            self.report({"ERROR"}, manager().last_error or "Hard reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Hard Reset ausgeführt")
+        self.report({"INFO"}, "Hard reset completed")
         return {"FINISHED"}
 
 
@@ -686,7 +686,8 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         header = layout.box()
         header.label(text="Blender Splitter")
         header.label(text=f"Version: {ADDON_VERSION}")
-        header.label(text=f"Entwickler: {ADDON_DEVELOPER}")
+        header.label(text=f"Developer: {ADDON_DEVELOPER}")
+        header.label(text=f"Mode (config): {mgr.effective_mode()}")
 
         layout.label(text="Cluster Configuration")
         layout.prop(cfg, "host")
@@ -741,7 +742,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row.operator("blendersplitter.kick_all", icon="X")
 
         if is_worker:
-            layout.label(text="Server-Aktionen auf Worker gesperrt")
+            layout.label(text="Server actions are disabled in worker mode")
 
         layout.separator()
         _draw_cluster_monitor(layout, mgr)
