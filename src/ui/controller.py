@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.runtime.facade import RuntimeConfig, SplitterRuntimeFacade
+from ..runtime.facade import RuntimeConfig, SplitterRuntimeFacade
 
 from .view_models import UiPanelModel
 
@@ -52,6 +52,14 @@ class UiController:
 
     def last_error(self) -> str:
         return self._facade.last_error
+
+    def get_legacy_manager_for_display(self) -> object:
+        """Return the legacy manager object for read-only display during migration.
+
+        Must not be used for state mutation.  All write operations must go
+        through the typed controller/facade methods.
+        """
+        return self._facade.get_legacy_manager_for_display()
 
     def panel_model(self) -> UiPanelModel:
         return UiPanelModel.from_status(self._facade.get_status())

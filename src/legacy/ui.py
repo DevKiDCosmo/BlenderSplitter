@@ -9,10 +9,9 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
-from .src.runtime.facade import RuntimeConfig, SplitterRuntimeFacade
-from .src.ui.controller import UiController
+from ..runtime.facade import RuntimeConfig, SplitterRuntimeFacade
+from ..ui.controller import UiController
 from .tiles import generate_tiles, grid_for_tile_count, tile_target_for_workers, overlap_pixels
-from .worker import manager
 
 ADDON_VERSION = "0.3.0"
 ADDON_DEVELOPER = "DevKiD"
@@ -24,12 +23,17 @@ _runtime_facade = SplitterRuntimeFacade()
 _ui_controller = UiController(_runtime_facade)
 
 
+def _get_mgr():
+    """Return the legacy manager for read-only display use only."""
+    return _ui_controller.get_legacy_manager_for_display()
+
+
 def _runtime_config_from_settings(cfg):
     return RuntimeConfig(
         host=cfg.host,
         server_port=cfg.server_port,
         discovery_port=cfg.discovery_port,
-        startup_mode=manager().effective_mode(),
+        startup_mode=_ui_controller.get_effective_mode(),
         output_dir=cfg.output_dir,
         overlap_percent=cfg.overlap_percent,
         tile_coefficient=cfg.tile_coefficient,
@@ -65,22 +69,7 @@ def _sync_runtime_settings(context=None):
     if ctx is None or ctx.scene is None or not hasattr(ctx.scene, "blendersplitter_settings"):
         return
 
-    scene = ctx.scene
-    cfg = scene.blendersplitter_settings
-
-    manager().configure(
-        cfg.host,
-        cfg.server_port,
-        cfg.discovery_port,
-        cfg.overlap_percent,
-        cfg.max_retries,
-        cfg.auto_sync_project,
-        cfg.show_render_window,
-        cfg.server_render_tiles,
-        cfg.tile_coefficient,
-        cfg.output_dir,
-    )
-    _ui_controller.apply_config(_runtime_config_from_settings(cfg))
+    _ui_controller.apply_config(_runtime_config_from_settings(ctx.scene.blendersplitter_settings))
     _tag_redraw_all(ctx)
 
 
@@ -92,8 +81,10 @@ def _ui_refresh_tick():
     if not _ui_refresh_registered:
         return None
     try:
-        mgr = manager()
-        if mgr.started or mgr.sync_active or mgr.pending_jobs:
+        model = _ui_controller.panel_model()
+        mgr = _get_mgr()
+        active = model.workers_online > 0 or (mgr is not None and (mgr.started or mgr.sync_active or mgr.pending_jobs))
+        if active:
             wm = bpy.context.window_manager if bpy.context else None
             if wm:
                 for window in wm.windows:
@@ -118,7 +109,7 @@ def _color_for_target(target):
 
 
 def _build_preview_plan(cfg, mgr):
-    if mgr.current_render_config and mgr.render_plan:
+    if mgr is not None and mgr.current_render_config and mgr.render_plan:
         return mgr.render_plan
 
     scene = bpy.context.scene
@@ -126,7 +117,7 @@ def _build_preview_plan(cfg, mgr):
     res_x = max(1, int(render.resolution_x * (render.resolution_percentage / 100.0)))
     res_y = max(1, int(render.resolution_y * (render.resolution_percentage / 100.0)))
 
-    if mgr.role == "server" and mgr.started and mgr.connected_workers:
+    if mgr is not None and mgr.role == "server" and mgr.started and mgr.connected_workers:
         total_nodes = len(mgr.connected_workers) + (1 if cfg.server_render_tiles else 0)
     else:
         total_nodes = cfg.worker_count + (1 if cfg.server_render_tiles else 0)
@@ -169,7 +160,7 @@ def _draw_preview_callback():
         region = context.region
         if region is None:
             return
-        mgr = manager()
+        mgr = _get_mgr()
         cfg = context.scene.blendersplitter_settings
         plan = _build_preview_plan(cfg, mgr)
 
@@ -252,7 +243,7 @@ def _draw_camera_border_callback():
         if getattr(context.region_data, "view_perspective", "") != "CAMERA":
             return
 
-        mgr = manager()
+        mgr = _get_mgr()
         cfg = context.scene.blendersplitter_settings
         plan = _build_preview_plan(cfg, mgr)
         if not plan:
@@ -316,6 +307,9 @@ def _draw_camera_border_callback():
 def _draw_cluster_monitor(layout, mgr):
     box = layout.box()
     box.label(text="Cluster Monitor")
+    if mgr is None:
+        box.label(text="Runtime unavailable")
+        return
     box.label(text=f"Role: {mgr.role}")
     box.label(text=f"Started: {'yes' if mgr.started else 'no'}")
     box.label(text=f"Endpoint: {mgr.server_host}:{mgr.server_port}")
@@ -378,21 +372,8 @@ class BLENDERSPLITTER_OT_start_network(bpy.types.Operator):
     bl_label = "Start Cluster"
 
     def execute(self, context):
-        cfg = context.scene.blendersplitter_settings
-        mgr = manager()
-        mgr.configure(
-            cfg.host,
-            cfg.server_port,
-            cfg.discovery_port,
-            cfg.overlap_percent,
-            cfg.max_retries,
-            cfg.auto_sync_project,
-            cfg.show_render_window,
-            cfg.server_render_tiles,
-            cfg.tile_coefficient,
-            cfg.output_dir,
-        )
-        mgr.start()
+        _apply_runtime_controller_config(context)
+        _ui_controller.start_runtime()
         self.report({"INFO"}, "Cluster gestartet")
         return {"FINISHED"}
 
@@ -402,7 +383,7 @@ class BLENDERSPLITTER_OT_stop_network(bpy.types.Operator):
     bl_label = "Stop Cluster"
 
     def execute(self, context):
-        manager().stop()
+        _ui_controller.stop_runtime()
         self.report({"INFO"}, "Cluster gestoppt")
         return {"FINISHED"}
 
@@ -412,25 +393,12 @@ class BLENDERSPLITTER_OT_start_server(bpy.types.Operator):
     bl_label = "Force Server"
 
     def execute(self, context):
-        cfg = context.scene.blendersplitter_settings
-        mgr = manager()
-        mgr.configure(
-            cfg.host,
-            cfg.server_port,
-            cfg.discovery_port,
-            cfg.overlap_percent,
-            cfg.max_retries,
-            cfg.auto_sync_project,
-            cfg.show_render_window,
-            cfg.server_render_tiles,
-            cfg.tile_coefficient,
-            cfg.output_dir,
-        )
-        ok = mgr.force_start_server()
+        _apply_runtime_controller_config(context)
+        ok = _ui_controller.force_start_server()
         if ok:
             self.report({"INFO"}, "Server gestartet")
             return {"FINISHED"}
-        self.report({"ERROR"}, mgr.last_error or "Serverstart fehlgeschlagen")
+        self.report({"ERROR"}, _ui_controller.last_error() or "Serverstart fehlgeschlagen")
         return {"CANCELLED"}
 
 
@@ -442,7 +410,7 @@ class BLENDERSPLITTER_OT_cluster_monitor_popup(bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self, width=640)
 
     def draw(self, context):
-        _draw_cluster_monitor(self.layout, manager())
+        _draw_cluster_monitor(self.layout, _get_mgr())
 
 
 class BLENDERSPLITTER_OT_install_requirements(bpy.types.Operator):
@@ -450,9 +418,9 @@ class BLENDERSPLITTER_OT_install_requirements(bpy.types.Operator):
     bl_label = "Install Requirements"
 
     def execute(self, context):
-        ok = manager().auto_install_requirements()
+        ok = _ui_controller.auto_install_requirements()
         if not ok:
-            self.report({"ERROR"}, manager().last_error)
+            self.report({"ERROR"}, _ui_controller.last_error())
             return {"CANCELLED"}
         self.report({"INFO"}, "Requirements installiert")
         return {"FINISHED"}
@@ -463,11 +431,11 @@ class BLENDERSPLITTER_OT_dry_run_integrity(bpy.types.Operator):
     bl_label = "Dry Run Integrity"
 
     def execute(self, context):
-        ok = manager().run_integrity_check(timeout_seconds=5.0)
+        ok = _ui_controller.run_integrity_check(timeout_s=5.0)
         if not ok:
-            self.report({"ERROR"}, manager().status)
+            self.report({"ERROR"}, _ui_controller.last_error() or "Integrity check failed")
             return {"CANCELLED"}
-        self.report({"INFO"}, manager().status)
+        self.report({"INFO"}, "Integrity OK")
         return {"FINISHED"}
 
 
@@ -477,13 +445,13 @@ class BLENDERSPLITTER_OT_sync_project_files(bpy.types.Operator):
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
-        mgr = manager()
-        prev_error = mgr.last_error
+        prev_error = _ui_controller.last_error()
         _ui_controller.sync_project()
-        if mgr.last_error and mgr.last_error != prev_error:
-            self.report({"ERROR"}, manager().last_error or manager().status)
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error)
             return {"CANCELLED"}
-        self.report({"INFO"}, manager().status)
+        self.report({"INFO"}, _ui_controller.panel_model().headline)
         return {"FINISHED"}
 
 
@@ -493,11 +461,11 @@ class BLENDERSPLITTER_OT_distributed_render(bpy.types.Operator):
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
-        mgr = manager()
-        prev_error = mgr.last_error
+        prev_error = _ui_controller.last_error()
         _ui_controller.start_render()
-        if mgr.last_error and mgr.last_error != prev_error:
-            self.report({"ERROR"}, manager().last_error or "Render konnte nicht gestartet werden")
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error or "Render konnte nicht gestartet werden")
             return {"CANCELLED"}
         self.report({"INFO"}, "Render gestartet")
         return {"FINISHED"}
@@ -509,11 +477,11 @@ class BLENDERSPLITTER_OT_abort_render(bpy.types.Operator):
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
-        mgr = manager()
-        prev_error = mgr.last_error
+        prev_error = _ui_controller.last_error()
         _ui_controller.cancel_render()
-        if mgr.last_error and mgr.last_error != prev_error:
-            self.report({"ERROR"}, manager().status)
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error)
             return {"CANCELLED"}
         self.report({"INFO"}, "Render abgebrochen")
         return {"FINISHED"}
@@ -524,7 +492,7 @@ class BLENDERSPLITTER_OT_kick_all(bpy.types.Operator):
     bl_label = "Kick All Workers"
 
     def execute(self, context):
-        manager().kick_all_workers()
+        _ui_controller.kick_all_workers()
         self.report({"INFO"}, "Alle Worker getrennt")
         return {"FINISHED"}
 
@@ -535,11 +503,11 @@ class BLENDERSPLITTER_OT_clean_worker_blends(bpy.types.Operator):
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
-        mgr = manager()
-        prev_error = mgr.last_error
+        prev_error = _ui_controller.last_error()
         _ui_controller.clean_workers()
-        if mgr.last_error and mgr.last_error != prev_error:
-            self.report({"ERROR"}, manager().last_error or "Clean fehlgeschlagen")
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error or "Clean fehlgeschlagen")
             return {"CANCELLED"}
         self.report({"INFO"}, "Clean-Befehl an Worker gesendet")
         return {"FINISHED"}
@@ -570,7 +538,7 @@ class BLENDERSPLITTER_OT_render_partition_image(bpy.types.Operator):
 
     def execute(self, context):
         cfg = context.scene.blendersplitter_settings
-        mgr = manager()
+        mgr = _get_mgr()
         plan = _build_preview_plan(cfg, mgr)
         if not plan:
             self.report({"ERROR"}, "Kein Plan verfügbar")
@@ -688,8 +656,8 @@ class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
     bl_label = "Reset"
 
     def execute(self, context):
-        if not manager().reset_runtime(hard=False):
-            self.report({"ERROR"}, manager().last_error or "Reset failed")
+        if not _ui_controller.reset_runtime(hard=False):
+            self.report({"ERROR"}, _ui_controller.last_error() or "Reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
         self.report({"INFO"}, "Reset completed")
@@ -701,8 +669,8 @@ class BLENDERSPLITTER_OT_hard_reset_runtime(bpy.types.Operator):
     bl_label = "Hard Reset"
 
     def execute(self, context):
-        if not manager().reset_runtime(hard=True):
-            self.report({"ERROR"}, manager().last_error or "Hard reset failed")
+        if not _ui_controller.reset_runtime(hard=True):
+            self.report({"ERROR"}, _ui_controller.last_error() or "Hard reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
         self.report({"INFO"}, "Hard reset completed")
@@ -719,14 +687,15 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         cfg = context.scene.blendersplitter_settings
-        mgr = manager()
-        is_worker = mgr.role == "worker"
+        mgr = _get_mgr()
+        model = _ui_controller.panel_model()
+        is_worker = model.role == "worker"
 
         header = layout.box()
         header.label(text="Blender Splitter")
         header.label(text=f"Version: {ADDON_VERSION}")
         header.label(text=f"Developer: {ADDON_DEVELOPER}")
-        header.label(text=f"Mode (config): {mgr.effective_mode()}")
+        header.label(text=f"Mode (config): {_ui_controller.get_effective_mode()}")
 
         layout.label(text="Cluster Configuration")
         layout.prop(cfg, "host")
@@ -744,7 +713,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         plan = _build_preview_plan(cfg, mgr)
         summary.label(text="Tile Plan")
         summary.label(text=f"Planned Tiles: {len(plan)}")
-        if mgr.expected_jobs > 0:
+        if mgr is not None and getattr(mgr, "expected_jobs", 0) > 0:
             summary.label(text=f"Rendered: {len(mgr.completed_jobs)}/{mgr.expected_jobs}")
             summary.label(text=f"Pending/In-Flight: {len(mgr.job_queue)}/{len(mgr.pending_jobs)}")
 
@@ -797,7 +766,7 @@ class BLENDERSPLITTER_PT_tile_preview(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         cfg = context.scene.blendersplitter_settings
-        mgr = manager()
+        mgr = _get_mgr()
 
         layout.label(text="Worker Count Preview")
         layout.prop(cfg, "worker_count")
@@ -826,11 +795,11 @@ class BLENDERSPLITTER_PT_sync_progress(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        mgr = manager()
-        return mgr.sync_active or bool(mgr.incoming_project_progress)
+        mgr = _get_mgr()
+        return mgr is not None and (mgr.sync_active or bool(mgr.incoming_project_progress))
 
     def draw(self, context):
-        mgr = manager()
+        mgr = _get_mgr()
         layout = self.layout
 
         pkg = mgr.sync_package_info or {}

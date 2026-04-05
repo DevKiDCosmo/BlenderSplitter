@@ -338,3 +338,11 @@ class SplitterRuntimeFacade:
         result = bool(mgr.force_start_server())
         self._update_status()
         return result
+
+    def get_legacy_manager_for_display(self) -> LegacyManager | None:
+        """Return the legacy manager for read-only display during migration.
+
+        Callers must treat the returned object as opaque and must not mutate
+        state through it.  Use the typed facade methods for all write operations.
+        """
+        return self._get_legacy_manager()

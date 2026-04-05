@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Validate root compatibility wrappers
 python3 -m py_compile __init__.py network.py robust_connection.py robust_protocol.py robust_transfer.py stitch.py tiles.py worker.py ui.py || true
+
+# Validate src/ modules (primary architecture)
+find src -name "*.py" | xargs python3 -m py_compile || true
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADDON_DIR_NAME="$(basename "$ROOT_DIR")"

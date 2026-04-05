@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.runtime.facade import PanelStatus
+from ..runtime.facade import PanelStatus
 
 
 @dataclass
