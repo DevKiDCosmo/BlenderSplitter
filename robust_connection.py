@@ -1,35 +1,6 @@
-from dataclasses import dataclass
-import random
+"""Compatibility wrapper for legacy robust_connection module."""
 
-
-@dataclass
-class ReconnectPolicy:
-    rediscover_after: int = 3
-    self_host_after: int = 8
-    max_sleep: float = 3.0
-
-
-class ReconnectController:
-    def __init__(self, policy: ReconnectPolicy | None = None):
-        self.policy = policy or ReconnectPolicy()
-        self.failures = 0
-
-    def reset(self) -> None:
-        self.failures = 0
-
-    def on_failure(self) -> int:
-        self.failures += 1
-        return self.failures
-
-    def should_rediscover(self) -> bool:
-        return self.failures >= self.policy.rediscover_after
-
-    def should_self_host(self) -> bool:
-        return self.failures >= self.policy.self_host_after
-
-    def sleep_seconds(self) -> float:
-        # exponential backoff with jitter
-        base = 0.3
-        backoff = base * (2 ** max(0, self.failures - 1))
-        jitter = random.random() * 0.25
-        return min(self.policy.max_sleep, backoff + jitter)
+try:
+    from .src.legacy.robust_connection import *  # type: ignore[F401,F403]
+except ImportError:
+    from src.legacy.robust_connection import *  # type: ignore[F401,F403]

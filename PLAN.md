@@ -2,6 +2,8 @@
 
 Statusdatum: 2026-04-05
 
+Vollmigrationsplan (neu): siehe `MIGRATION_PLAN_FULL_V2.md`.
+
 Kurz: Ich habe die Codebasis verglichen, die Regressionen in `clean`/`sync` analysiert und gezielt in `worker.py` gehärtet. Packaging und Konfigurationspfad wurden ebenfalls bereinigt. Nachfolgend eine knappe Zusammenfassung des Erledigten und eine priorisierte Liste der verbleibenden Arbeiten mit konkreten nächsten Schritten.
 
 Erledigt
@@ -14,6 +16,8 @@ Erledigt
 - Sanity: `python -m py_compile` für geänderte Dateien — keine Syntaxfehler.
 
 Offene / Priorisierte Aufgaben
+E) Kamera Selektion für Batch Render.
+e1) Network Handling async zum Rendern, damit nicht occupied und sofortige intervention möglich.
 1) Worker Runtime Adapter (Blender-boundary): Ziel: `DistributedRenderManager` entkoppeln, klare Adapter-Schnittstelle für Blender-spezifische Calls. Nächster Schritt: RFC/Interface-Definition + eine kleine Refactor-PR, damit Tests möglich werden.
 2) Integration Smoke Tests (Blender): Manuelle E2E-Prüfung (Start Server → verbinde 2+ Worker → `Kick All` → Reconnect → `Sync` → `Clean` → verteiltes Rendern). Nächster Schritt: Smoke-Test-Skript + Anweisungen für Blender-Run.
 3) Unit/Integration Tests für Clean/Sync ACKs: automatisierte Tests, die `clean_worker_blends` und `sync_project_files` gegen gemockte/simulierte Worker-Sockets prüfen.

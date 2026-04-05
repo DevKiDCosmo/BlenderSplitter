@@ -1,0 +1,1 @@
+"""BlenderSplitter source package."""
