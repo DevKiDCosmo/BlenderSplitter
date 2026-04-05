@@ -51,6 +51,15 @@ try:
 except ImportError:
     websockets = None
 
+try:
+    # import common exceptions if available for finer-grained handling
+    from websockets.exceptions import (
+        ConnectionClosedError,
+        ConnectionClosedOK,
+        InvalidHandshake,
+    )
+except Exception:
+    ConnectionClosedError = ConnectionClosedOK = InvalidHandshake = Exception
 
 def _load_websockets_module() -> bool:
     global websockets
@@ -124,6 +133,7 @@ class DistributedRenderManager:
         self.target_ready_at = {}
         self.dispatch_cooldown_seconds = 1.0
         self.dispatch_targets = []
+        self._defer_master_until_workers_primed = False
 
         self.current_output_root = ""
         self.current_master_dir = ""
@@ -726,30 +736,58 @@ class DistributedRenderManager:
         url = f"ws://{host}:{port}"
         self._reconnect.reset()
 
+        async def _safe_send(ws, payload, retries=3, initial_delay=0.15):
+            data = json_dumps(payload)
+            for attempt in range(retries):
+                try:
+                    await ws.send(data)
+                    return True
+                except Exception as exc:
+                    self.last_error = f"send failed: {exc}"
+                    await asyncio.sleep(initial_delay * (attempt + 1))
+            return False
+
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(url, ping_interval=30, ping_timeout=300, max_size=None, open_timeout=10) as ws:
+                async with websockets.connect(
+                    url, ping_interval=30, ping_timeout=300, max_size=None, open_timeout=10
+                ) as ws:
                     self._reconnect.reset()
                     self._worker_socket = ws
                     self.server_host = host
                     self.server_port = port
                     self.status = f"Verbunden als Worker: {host}:{port}"
 
-                    await ws.send(
-                        json_dumps(
-                            {
-                                "type": MSG_REGISTER_WORKER,
-                                "node_id": self.node_id,
-                                "app": bpy.app.version_string,
-                            }
-                        )
+                    ok = await _safe_send(
+                        ws,
+                        {
+                            "type": MSG_REGISTER_WORKER,
+                            "node_id": self.node_id,
+                            "app": bpy.app.version_string,
+                        },
                     )
+                    if not ok:
+                        raise ConnectionClosedError("initial register send failed")
 
-                    async for raw in ws:
-                        if isinstance(raw, (bytes, bytearray)):
-                            continue
-                        msg = json.loads(raw)
-                        await self._handle_worker_message(ws, msg)
+                    try:
+                        async for raw in ws:
+                            if isinstance(raw, (bytes, bytearray)):
+                                continue
+                            try:
+                                msg = json.loads(raw)
+                            except Exception:
+                                # ignore invalid messages but keep connection alive
+                                continue
+                            await self._handle_worker_message(ws, msg)
+                    except (ConnectionClosedError, ConnectionClosedOK):
+                        # normal disconnects handled by outer reconnect loop
+                        pass
+            except InvalidHandshake as exc:
+                # Handshake failed — likely wrong URL/port or incompatible server
+                err = str(exc)
+                self.last_error = err
+                self._reconnect.on_failure()
+                self.status = f"Handshake fehlgeschlagen: {err}"
             except Exception as exc:
                 if self._takeover_requested:
                     self._takeover_requested = False
@@ -758,7 +796,7 @@ class DistributedRenderManager:
                 self.last_error = err
                 self._reconnect.on_failure()
 
-                if "Errno 61" in err or "Connect call failed" in err:
+                if "Errno 61" in err or "Connect call failed" in err or isinstance(exc, OSError):
                     self.status = f"Server nicht erreichbar ({host}:{port}), suche neu..."
                 else:
                     self.status = f"Reconnect: {err}"
@@ -1415,34 +1453,40 @@ class DistributedRenderManager:
             self.last_error = "Event loop not available"
             return False
 
-        workers = list(self.connected_workers.keys())
+        workers = self._active_worker_ids()
         if not workers:
-            self.status = "No workers connected"
+            self.last_error = "Keine aktiven Worker für Clean verbunden"
+            self.status = self.last_error
             return False
 
         self.clean_results = {}
+        timeout_seconds = 12.0
 
         async def _send():
-            for _, info in list(self.connected_workers.items()):
+            for worker_id in workers:
+                info = self.connected_workers.get(worker_id)
                 ws = info.get("socket")
                 if ws is None:
+                    self.clean_results[worker_id] = {"ok": False, "deleted": 0, "error": "socket missing"}
                     continue
                 try:
                     await ws.send(json_dumps({"type": MSG_CLEAN_BLEND}))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.clean_results[worker_id] = {"ok": False, "deleted": 0, "error": str(exc)}
 
-        try:
-            asyncio.run_coroutine_threadsafe(_send(), self._loop)
-            deadline = time.time() + 10.0
+            deadline = time.time() + timeout_seconds
             while time.time() < deadline:
                 if len(self.clean_results) >= len(workers):
                     break
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
 
             missing = [wid for wid in workers if wid not in self.clean_results]
             for wid in missing:
                 self.clean_results[wid] = {"ok": False, "deleted": 0, "error": "ack timeout"}
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_send(), self._loop)
+            fut.result(timeout=timeout_seconds + 2.0)
 
             failed = [wid for wid, item in self.clean_results.items() if not item.get("ok")]
             if failed:
@@ -1452,9 +1496,11 @@ class DistributedRenderManager:
 
             total_deleted = sum(int(item.get("deleted", 0)) for item in self.clean_results.values())
             self.status = f"Clean finished: deleted {total_deleted} blend file(s)"
+            self.last_error = ""
             return True
         except Exception as exc:
             self.last_error = str(exc)
+            self.status = f"Clean failed: {exc}"
             return False
 
     def _apply_received_project_bundle(self, transfer):
@@ -1612,6 +1658,7 @@ class DistributedRenderManager:
         self.dispatch_targets = list(targets)
         self.target_inflight = {target: 0 for target in self.dispatch_targets}
         self.target_ready_at = {target: 0.0 for target in self.dispatch_targets}
+        self._defer_master_until_workers_primed = bool(self.server_render_tiles and len(workers) > 0)
 
         # Queue all jobs first; dispatch continuously as targets become free.
         for tile in tiles:
@@ -1643,6 +1690,17 @@ class DistributedRenderManager:
 
         if target != "MASTER" and target not in self.connected_workers:
             return False
+
+        if target == "MASTER" and self._defer_master_until_workers_primed:
+            # The first master job is delayed until each active worker got one initial job.
+            worker_targets = [
+                wid
+                for wid in self.dispatch_targets
+                if wid != "MASTER" and wid in self.connected_workers
+            ]
+            if worker_targets and any(int(self.target_inflight.get(wid, 0)) <= 0 for wid in worker_targets):
+                return False
+            self._defer_master_until_workers_primed = False
 
         if not self.job_queue:
             return False
@@ -1693,6 +1751,28 @@ class DistributedRenderManager:
         except Exception:
             pass
 
+    def _socket_is_usable(self, ws) -> bool:
+        if ws is None:
+            return False
+        try:
+            if bool(getattr(ws, "closed", False)):
+                return False
+            if bool(getattr(ws, "close_code", None)):
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _active_worker_ids(self) -> list[str]:
+        active: list[str] = []
+        for worker_id, info in list(self.connected_workers.items()):
+            ws = info.get("socket") if info else None
+            if self._socket_is_usable(ws):
+                active.append(worker_id)
+            else:
+                self.connected_workers.pop(worker_id, None)
+        return active
+
     def sync_project_files(self, timeout_seconds=180.0):
         if self.role != "server":
             self.status = "Starte Server vor Projekt-Sync"
@@ -1704,7 +1784,7 @@ class DistributedRenderManager:
         if scene is not None:
             self._sync_runtime_config_from_scene(scene)
 
-        workers = list(self.connected_workers.keys())
+        workers = self._active_worker_ids()
         if not workers:
             self.status = "Keine Worker für Projekt-Sync verbunden"
             return False
@@ -1997,6 +2077,7 @@ class DistributedRenderManager:
         self.target_inflight = {}
         self.target_ready_at = {}
         self.dispatch_targets = []
+        self._defer_master_until_workers_primed = False
         self.render_plan = []
         self.expected_jobs = 0
         self.current_render_config = None
@@ -2052,6 +2133,10 @@ class DistributedRenderManager:
                 except Exception:
                     pass
             self.connected_workers.pop(worker_id, None)
+            self.worker_sync_state = {}
+            self.project_sync_results = {}
+            self.clean_results = {}
+            self._defer_master_until_workers_primed = False
         self.status = f"Alle Worker getrennt ({len(ids)})"
         return True
 

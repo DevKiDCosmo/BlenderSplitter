@@ -1,1 +1,3 @@
 .agents
+.venv
+dist/

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import random
 
 
 @dataclass
@@ -27,4 +28,8 @@ class ReconnectController:
         return self.failures >= self.policy.self_host_after
 
     def sleep_seconds(self) -> float:
-        return min(self.policy.max_sleep, 0.4 + 0.35 * float(self.failures))
+        # exponential backoff with jitter
+        base = 0.3
+        backoff = base * (2 ** max(0, self.failures - 1))
+        jitter = random.random() * 0.25
+        return min(self.policy.max_sleep, backoff + jitter)
