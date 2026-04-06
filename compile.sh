@@ -12,11 +12,19 @@ ADDON_DIR_NAME="$(basename "$ROOT_DIR")"
 PARENT_DIR="$(dirname "$ROOT_DIR")"
 DIST_DIR="$ROOT_DIR/dist"
 CONFIG_TEMPLATES_DIR="$ROOT_DIR/config/templates"
+BUILD_FILE="$ROOT_DIR/.build"
 
 mkdir -p "$DIST_DIR"
 
+# Build tracker increment
+if [[ ! -f "$BUILD_FILE" ]]; then
+  echo "0" > "$BUILD_FILE"
+fi
+BUILD_NUM=$(($(cat "$BUILD_FILE") + 1))
+echo "$BUILD_NUM" > "$BUILD_FILE"
+
 # Read centralized VERSION file if present, otherwise fall back to existing parsing
-VERSION_FILE="$ROOT_DIR/VERSION"
+VERSION_FILE="$ROOT_DIR/version"
 if [[ -f "$VERSION_FILE" ]]; then
   VERSION="$(cat "$VERSION_FILE" | tr -d '\n' | tr -d '\r')"
 else
@@ -35,6 +43,9 @@ fi
 if [[ -z "$VERSION" ]]; then
   VERSION="dev"
 fi
+
+# Append build number to version for tracking
+FULL_VERSION="${VERSION}+build.${BUILD_NUM}"
 
 # Create temporary build directory for mode-specific packaging
 TEMP_BUILD_DIR=$(mktemp -d)
@@ -62,13 +73,23 @@ for mode in worker master user worker_master; do
   rm -rf "$TEMP_ADDON"
   cp -r "$ADDON_DIR_NAME" "$TEMP_ADDON"
   
+  # Inject build metadata for runtime display
+  cat > "$TEMP_ADDON/build_metadata.py" <<EOF
+VERSION = "$VERSION"
+BUILD_NUMBER = $BUILD_NUM
+BUILD_TIME = $(date +%s)
+FULL_VERSION = "$FULL_VERSION"
+EOF
+
   # Copy mode-specific config into the temp addon
   if [[ -f "$CONFIG_TEMPLATES_DIR/${mode}.json" ]]; then
     cp "$CONFIG_TEMPLATES_DIR/${mode}.json" "$TEMP_ADDON/config.json"
     echo "Embedded config for mode: $mode"
   fi
   
-  OUT_ZIP="$DIST_DIR/${ADDON_DIR_NAME}-${VERSION}-${mode}.zip"
+  # Use a sanitized version for the filename (no spaces)
+  FILE_VERSION=$(echo "$FULL_VERSION" | tr ' ' '_')
+  OUT_ZIP="$DIST_DIR/${ADDON_DIR_NAME}-${FILE_VERSION}-${mode}.zip"
   rm -f "$OUT_ZIP"
   
   # Create zip from temp with exclusions
@@ -80,6 +101,7 @@ for mode in worker master user worker_master; do
         "$ADDON_DIR_NAME/*.pyc" \
         "$ADDON_DIR_NAME/PLAN.md" \
         "$ADDON_DIR_NAME/config/templates/*" \
+        "$ADDON_DIR_NAME/.build" \
     >/dev/null
   popd >/dev/null
   
@@ -113,7 +135,7 @@ manifest = {
 print(json.dumps(manifest, indent=2))
 PY
 )
-python3 - "$DIST_DIR" "$VERSION" <<PYOUT
+python3 - "$DIST_DIR" "$FULL_VERSION" <<PYOUT
 ${PYTHON_MANIFEST}
 PYOUT
  > "$DIST_DIR/manifest.json" 2>/dev/null || true

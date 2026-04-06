@@ -2,6 +2,26 @@
 
 This document describes how the add-on currently works in practice: discovery, sync, tile distribution, stitching, and clean-up.
 
+## Update 2026-04-06 - Neu hinzugefuegte Features und aktueller Migrationsstand
+
+### Bereits hinzugefuegt
+- `src/`-Architekturmodule sind aufgebaut (`runtime`, `network`, `scheduler`, `sync`, `blender_adapter`, `config`, `ui`).
+- Runtime-Fassade und Controller-Pfad sind eingefuehrt; zentrale UI-Operationen laufen ueber die Fassade.
+- Direkte Legacy-Abhaengigkeiten in relevanten UI-Pfaden wurden reduziert.
+- `bpy`-Boundary wurde in `src/blender_adapter/bpy_adapter.py` fuer Kernoperationen konkretisiert.
+- Startup wurde auf einen konsolidierten Fassade-/Composition-Root-Pfad umgestellt (mit Blender-Verfuegbarkeits-Guard).
+- Scheduler- und Sync-Tests wurden als Boundary-Tests ergaenzt (`tests/test_scheduler.py`, `tests/test_sync.py`).
+- Build/Validation wurde erweitert (`compile.sh` prueft auch `src/`-Module).
+- Netzwerk- und Protokollrobustheit wurde gehaertet (u. a. Backoff/Jitter und ACK-Verhalten).
+
+### Noch offen (kurz)
+- Vollstaendige Entkopplung von `src/legacy/*`.
+- Finale Scheduler-/Sync-Endverdrahtung in `src/*` als einzige Quelle.
+- Entfernung der Root-Kompatibilitaetswrapper nach Paritaetsnachweis.
+
+### Single Source of Truth
+Der konsolidierte Projektstand, alle offenen Aufgaben und Prioritaeten sind in `UNIVERSAL_STATUS.md` dokumentiert.
+
 ## 1. Goal and Scope
 
 BlenderSplitter is a distributed tile renderer for Blender:
