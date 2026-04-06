@@ -27,7 +27,7 @@ except ImportError:
     _BPY_AVAILABLE = False
 
 if _BPY_AVAILABLE:
-    from . import ui
+    from .src.legacy import ui
     from .src.runtime.facade import RuntimeConfig, SplitterRuntimeFacade
 
     _addon_facade: "SplitterRuntimeFacade | None" = None
