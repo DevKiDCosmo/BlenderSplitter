@@ -25,6 +25,8 @@ from .robust_protocol import (
     MSG_HEARTBEAT,
     MSG_INTEGRITY_PROBE,
     MSG_INTEGRITY_RESULT,
+    MSG_NEW_MASTER,
+    MSG_NEW_MASTER_DELAY_S,
     MSG_PING,
     MSG_PROJECT_SYNC_ACK,
     MSG_PROJECT_SYNC_CHUNK,
@@ -185,6 +187,10 @@ class DistributedRenderManager:
         self._reconnect = ReconnectController(ReconnectPolicy(rediscover_after=3, self_host_after=8, max_sleep=3.0))
         self._worker_render_view_opened = False
         self._takeover_requested = False
+        # Stores {host, port} when a MSG_NEW_MASTER redirect is received.
+        # The worker reconnect loop checks this after each connection cycle
+        # and sleeps MSG_NEW_MASTER_DELAY_S before reconnecting to the new master.
+        self._pending_new_master: dict | None = None
 
     def configure(
         self,
@@ -346,9 +352,24 @@ class DistributedRenderManager:
             except RuntimeError:
                 pass
 
+    def set_force_server(self, enabled: bool) -> None:
+        """No-op compatibility stub (force-start is handled via force_start_server())."""
+
     def force_start_server(self):
-        if not self.started:
-            self.start()
+        """Request server-role takeover from the current master.
+
+        Only callable when this node is already connected to an existing server
+        (i.e., ``self.role == "worker"`` and a worker socket is open).  Calling
+        it in any other state is a no-op that returns ``False`` with an error
+        message, so the UI poll() guard can safely map directly to this check.
+        """
+        if self.role != "worker" or self._worker_socket is None:
+            self.last_error = (
+                "Force Server ist nur möglich, wenn dieser Knoten als Worker "
+                "mit einem bestehenden Master verbunden ist."
+            )
+            self.status = self.last_error
+            return False
         if not self._loop_ready.wait(timeout=3.0):
             self.last_error = "Loop nicht bereit"
             self.status = self.last_error
@@ -359,6 +380,7 @@ class DistributedRenderManager:
             _ = fut.result(timeout=8.0)
             return True
         except Exception as exc:
+            self._takeover_requested = False
             self.last_error = str(exc)
             self.status = f"Force server fehlgeschlagen: {exc}"
             return False
@@ -638,16 +660,37 @@ class DistributedRenderManager:
         self.status = f"Mode: {mode}"
 
         if mode == "master":
-            self.status = "Mode master: starting local server"
+            # Master mode: search for an existing server first; only become
+            # server if none is found (requirement: "Master first search for
+            # another master. If no exist it automatically make itself present.").
+            self.status = "Mode master: Suche nach bestehendem Server..."
+            found = discover_server(self.discovery_port, timeout=1.5)
+            if found:
+                host, port = found
+                self.role = "worker"
+                self.status = f"Mode master: Server gefunden {host}:{port}, verbinde als Worker"
+                await self._connect_as_worker(host, port)
+                return
+            self.status = "Mode master: Kein Server gefunden, starte lokalen Server"
             await self._start_server()
             return
 
         if mode == "master_worker":
-            self.status = "Mode master_worker: starting local server"
+            # Master-Worker mode: search first, become server if none found.
+            self.status = "Mode master_worker: Suche nach bestehendem Server..."
+            found = discover_server(self.discovery_port, timeout=1.5)
+            if found:
+                host, port = found
+                self.role = "worker"
+                self.status = f"Server gefunden: {host}:{port}"
+                await self._connect_as_worker(host, port)
+                return
+            self.status = "Mode master_worker: Kein Server gefunden, starte lokalen Server"
             await self._start_server()
             return
 
         if mode == "worker":
+            # Worker mode: search indefinitely — never becomes server.
             self.status = "Mode worker: searching for server"
             while not self._stop_event.is_set():
                 found = discover_server(self.discovery_port, timeout=1.5)
@@ -660,6 +703,7 @@ class DistributedRenderManager:
                 await asyncio.sleep(0.8)
             return
 
+        # "user" mode (or unknown): 6 attempts then fall back to self-hosting.
         self.status = "Searching server..."
         for attempt in range(6):
             found = discover_server(self.discovery_port, timeout=1.5)
@@ -778,17 +822,24 @@ class DistributedRenderManager:
                             except Exception:
                                 # ignore invalid messages but keep connection alive
                                 continue
-                            await self._handle_worker_message(ws, msg)
+                            # _handle_worker_message returns True when the inner
+                            # loop should be broken (e.g. MSG_NEW_MASTER redirect).
+                            if await self._handle_worker_message(ws, msg):
+                                break
                     except (ConnectionClosedError, ConnectionClosedOK):
                         # normal disconnects handled by outer reconnect loop
                         pass
+                # Context-manager exit closes the socket; reset the cached ref.
+                self._worker_socket = None
             except InvalidHandshake as exc:
                 # Handshake failed — likely wrong URL/port or incompatible server
+                self._worker_socket = None
                 err = str(exc)
                 self.last_error = err
                 self._reconnect.on_failure()
                 self.status = f"Handshake fehlgeschlagen: {err}"
             except Exception as exc:
+                self._worker_socket = None
                 if self._takeover_requested:
                     self._takeover_requested = False
                     return
@@ -816,6 +867,21 @@ class DistributedRenderManager:
 
                 await asyncio.sleep(self._reconnect.sleep_seconds())
 
+            # --- Handle new-master redirect (MSG_NEW_MASTER) ---
+            if self._pending_new_master is not None:
+                pending = self._pending_new_master
+                self._pending_new_master = None
+                self.status = (
+                    f"Neuer Master: {pending['host']}:{pending['port']} "
+                    f"(warte {MSG_NEW_MASTER_DELAY_S:.0f}s)"
+                )
+                await asyncio.sleep(MSG_NEW_MASTER_DELAY_S)
+                host = pending["host"]
+                port = pending["port"]
+                url = f"ws://{host}:{port}"
+                self._reconnect.reset()
+                continue  # reconnect to the new master
+
             if self._takeover_requested:
                 self._takeover_requested = False
                 return
@@ -826,7 +892,11 @@ class DistributedRenderManager:
             async for raw in websocket:
                 if isinstance(raw, (bytes, bytearray)):
                     continue
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # Malformed message — keep connection alive, don't crash handler
+                    continue
                 msg_type = msg.get("type")
 
                 if msg_type == MSG_REGISTER_WORKER:
@@ -841,6 +911,27 @@ class DistributedRenderManager:
                     continue
 
                 if msg_type == MSG_SERVER_TAKEOVER:
+                    new_host = msg.get("new_host", "") or _local_ip()
+                    new_port = int(msg.get("new_port", self.server_port) or self.server_port)
+
+                    # Broadcast MSG_NEW_MASTER to ALL remaining connected workers
+                    # so they know where to reconnect after the takeover.
+                    redirect_payload = json_dumps({
+                        "type": MSG_NEW_MASTER,
+                        "new_host": str(new_host),
+                        "new_port": int(new_port),
+                    })
+                    for wid, info in list(self.connected_workers.items()):
+                        if wid == worker_id:
+                            continue
+                        ws_other = info.get("socket") if info else None
+                        if ws_other is not None:
+                            try:
+                                await ws_other.send(redirect_payload)
+                            except Exception:
+                                pass
+
+                    # Release the requesting worker
                     if worker_id and worker_id in self.connected_workers:
                         self._reassign_jobs_from_worker(worker_id)
                         self.connected_workers.pop(worker_id, None)
@@ -848,7 +939,7 @@ class DistributedRenderManager:
                         await websocket.close()
                     except Exception:
                         pass
-                    self.status = "Worker released by force server"
+                    self.status = "Server-Takeover: neuer Master übernimmt Kontrolle"
                     return
 
                 if msg_type == MSG_CLEAN_BLEND_ACK:
@@ -896,8 +987,34 @@ class DistributedRenderManager:
                 del self.connected_workers[worker_id]
                 self.status = f"Worker disconnected: {len(self.connected_workers)}"
 
-    async def _handle_worker_message(self, websocket, msg):
+    async def _handle_worker_message(self, websocket, msg) -> bool:
+        """Handle a message received by a worker from its connected server.
+
+        Returns ``True`` when the inner message-receive loop should be broken
+        (e.g. after receiving ``MSG_NEW_MASTER``).  Returns ``False`` (or
+        implicitly ``None``) for normal messages.
+        """
         msg_type = msg.get("type")
+
+        # -------------------------------------------------------------------
+        # MSG_NEW_MASTER: old master redirecting us to a new server.
+        # Store the target, break the inner loop, sleep MSG_NEW_MASTER_DELAY_S,
+        # then reconnect to the new host in _connect_as_worker's outer loop.
+        # -------------------------------------------------------------------
+        if msg_type == MSG_NEW_MASTER:
+            new_host = str(msg.get("new_host", "") or "")
+            new_port_raw = msg.get("new_port", 0)
+            try:
+                new_port = int(new_port_raw)
+            except (TypeError, ValueError):
+                new_port = 0
+            if new_host and new_port:
+                self._pending_new_master = {"host": new_host, "port": new_port}
+                self.status = (
+                    f"Neuer Master angekündigt: {new_host}:{new_port} "
+                    f"(Verbinden in {MSG_NEW_MASTER_DELAY_S:.0f}s)"
+                )
+            return True  # break inner loop
 
         if msg_type == MSG_CLEAN_BLEND:
             # Server requested worker to remove any received .blend copies
@@ -1098,7 +1215,7 @@ class DistributedRenderManager:
                 self.sync_active = False
                 self.last_error = f"Projekt-Sync Fehler: {exc}"
                 self.status = self.last_error
-            return
+            return False
 
     def _render_tile_local(self, payload):
         if self.render_abort_requested:
@@ -1814,10 +1931,9 @@ class DistributedRenderManager:
 
     def sync_project_files(self, timeout_seconds=180.0):
         if self.role != "server":
-            self.status = "Starte Server vor Projekt-Sync"
-            if not self.force_start_server():
-                self.last_error = self.status
-                return False
+            self.last_error = "Projekt-Sync setzt Server-Rolle voraus. Zuerst Cluster als Server starten."
+            self.status = self.last_error
+            return False
 
         scene = _safe_scene()
         if scene is not None:

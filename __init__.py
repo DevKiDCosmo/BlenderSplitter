@@ -96,6 +96,13 @@ if _BPY_AVAILABLE:
             )
             if mgr.external_scheduler_enabled:
                 mgr.start_external_scheduler(Path(__file__).resolve().parent / "config.json")
+
+            # Auto-start the cluster for dedicated master/worker modes or when
+            # the "NETWORK" always-flag is set in the config template.
+            # "master_worker" and "user" modes require the user to click
+            # "Start Cluster" from the N-Panel.
+            if mode in ("master", "worker") or "NETWORK" in mgr.always_flags:
+                mgr.start()
         return None
 
     def register():

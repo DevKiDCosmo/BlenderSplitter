@@ -391,6 +391,18 @@ class BLENDERSPLITTER_OT_stop_network(bpy.types.Operator):
 class BLENDERSPLITTER_OT_start_server(bpy.types.Operator):
     bl_idname = "blendersplitter.start_server"
     bl_label = "Force Server"
+    bl_description = (
+        "Take over server role from the current master. "
+        "Only available when this node is connected as a worker."
+    )
+
+    @classmethod
+    def poll(cls, context):
+        """Enable only when this node is already connected as a worker."""
+        mgr = _get_mgr()
+        if mgr is None:
+            return False
+        return bool(mgr.started and mgr.role == "worker")
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
@@ -653,27 +665,29 @@ class BLENDERSPLITTER_PG_settings_v2(bpy.types.PropertyGroup):
 
 class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
     bl_idname = "blendersplitter.reset_runtime"
-    bl_label = "Reset"
+    bl_label = "Update Information"
+    bl_description = "Refresh runtime state and re-sync configuration from scene settings"
 
     def execute(self, context):
         if not _ui_controller.reset_runtime(hard=False):
-            self.report({"ERROR"}, _ui_controller.last_error() or "Reset failed")
+            self.report({"ERROR"}, _ui_controller.last_error() or "Update failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Reset completed")
+        self.report({"INFO"}, "Information updated")
         return {"FINISHED"}
 
 
 class BLENDERSPLITTER_OT_hard_reset_runtime(bpy.types.Operator):
     bl_idname = "blendersplitter.hard_reset_runtime"
-    bl_label = "Hard Reset"
+    bl_label = "Reset"
+    bl_description = "Full reset: clear all state and restore default settings"
 
     def execute(self, context):
         if not _ui_controller.reset_runtime(hard=True):
-            self.report({"ERROR"}, _ui_controller.last_error() or "Hard reset failed")
+            self.report({"ERROR"}, _ui_controller.last_error() or "Reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Hard reset completed")
+        self.report({"INFO"}, "Reset completed")
         return {"FINISHED"}
 
 
@@ -724,6 +738,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row.operator("blendersplitter.start_network", icon="PLAY")
         row.operator("blendersplitter.stop_network", icon="PAUSE")
 
+        # Force Server: poll() disables it unless role == "worker"
         layout.operator("blendersplitter.start_server", icon="NETWORK_DRIVE")
         layout.operator("blendersplitter.cluster_monitor_popup", icon="WINDOW")
 
@@ -738,8 +753,9 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         if not is_worker and not has_workers and model.started:
             layout.label(text="No workers connected yet", icon="INFO")
 
+        # Update Information / Reset — available for all roles (workers can refresh
+        # their own state too; actual runtime actions are no-ops for workers).
         row = layout.row(align=True)
-        row.enabled = not is_worker
         row.operator("blendersplitter.reset_runtime", icon="LOOP_BACK")
         row.operator("blendersplitter.hard_reset_runtime", icon="FILE_REFRESH")
 
@@ -757,7 +773,7 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row.operator("blendersplitter.kick_all", icon="X")
 
         if is_worker:
-            layout.label(text="Server actions are disabled in worker mode")
+            layout.label(text="Server-Aktionen im Worker-Modus deaktiviert", icon="INFO")
 
         layout.separator()
         _draw_cluster_monitor(layout, mgr)

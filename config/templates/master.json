@@ -1,9 +1,7 @@
 {
     "mode": "master",
     "user_mode": "master_worker",
-    "always": [
-        "NETWORK"
-    ],
+    "always": [],
     "network": {
         "host": "0.0.0.0",
         "server_port": 8765,
