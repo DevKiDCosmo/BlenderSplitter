@@ -717,6 +717,9 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
             summary.label(text=f"Rendered: {len(mgr.completed_jobs)}/{mgr.expected_jobs}")
             summary.label(text=f"Pending/In-Flight: {len(mgr.job_queue)}/{len(mgr.pending_jobs)}")
 
+        has_workers = mgr is not None and bool(mgr.connected_workers)
+        is_server = model.role == "server"
+
         row = layout.row(align=True)
         row.operator("blendersplitter.start_network", icon="PLAY")
         row.operator("blendersplitter.stop_network", icon="PAUSE")
@@ -726,10 +729,14 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
 
         layout.separator()
         layout.operator("blendersplitter.install_requirements", icon="CONSOLE")
-        row = layout.row()
-        row.enabled = not is_worker
+
+        # Sync / Clean — visually consistent with start/stop (align=True).
+        row = layout.row(align=True)
+        row.enabled = not is_worker and has_workers
         row.operator("blendersplitter.sync_project_files", icon="FILE_REFRESH")
         row.operator("blendersplitter.clean_worker_blends", icon="TRASH")
+        if not is_worker and not has_workers and model.started:
+            layout.label(text="No workers connected yet", icon="INFO")
 
         row = layout.row(align=True)
         row.enabled = not is_worker

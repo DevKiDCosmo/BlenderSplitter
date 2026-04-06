@@ -128,6 +128,10 @@ class SplitterRuntimeFacade:
            installed add-on package.
         2. ``src.legacy.worker`` – fallback when running without a package
            root (e.g. bare Python path during development).
+
+        On failure stores a structured diagnostic message in ``_legacy_error``
+        that includes every attempted module path and the exception raised for
+        each attempt (Issue #4/#5 fix).
         """
         global _legacy_worker_module
         if _legacy_worker_module is not None:
@@ -141,27 +145,35 @@ class SplitterRuntimeFacade:
             candidates.append(f"{root_package}.src.legacy.worker")
         candidates.append("src.legacy.worker")
 
+        failures: list[str] = []
         for candidate in candidates:
             try:
                 mod = importlib.import_module(candidate)
                 _legacy_worker_module = mod
                 return mod
-            except ImportError:
-                pass
+            except ImportError as exc:
+                failures.append(f"  [{candidate}]: {exc}")
 
+        self._legacy_error = (
+            "Legacy-Worker-Modul konnte nicht importiert werden. "
+            f"Versuchte Pfade:\n" + "\n".join(failures)
+        )
         return None
 
     def _get_legacy_manager(self) -> LegacyManager | None:
         """Return the singleton legacy ``DistributedRenderManager``."""
         module = self._get_legacy_module()
         if module is None:
-            self._legacy_error = "Legacy-Manager nicht importierbar"
+            # _legacy_error was already populated with structured details.
             return None
         try:
             legacy_module = cast(LegacyWorkerModule, cast(object, module))
             return legacy_module.manager()
         except (AttributeError, TypeError, RuntimeError, ValueError) as exc:
-            self._legacy_error = f"Legacy-Manager Aufruf fehlgeschlagen: {exc}"
+            self._legacy_error = (
+                f"Legacy-Manager-Aufruf fehlgeschlagen "
+                f"({type(exc).__name__}): {exc}"
+            )
             return None
 
     def _apply_config_to_legacy(self, mgr: LegacyManager) -> None:

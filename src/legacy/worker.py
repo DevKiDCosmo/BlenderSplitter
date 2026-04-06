@@ -1009,6 +1009,7 @@ class DistributedRenderManager:
                 "project_name": msg.get("project_name", "project"),
                 "blend_name": msg.get("blend_name", ""),
                 "sync_context": msg.get("sync_context", {}),
+                "runtime_config": msg.get("runtime_config", {}),
                 "total_size": int(msg.get("total_size", 0)),
                 "total_chunks": int(msg.get("total_chunks", 0)),
                 "sha256": msg.get("sha256", ""),
@@ -1305,6 +1306,15 @@ class DistributedRenderManager:
                 "file_count": len(file_map),
                 "source_total_size": total_source_size,
                 "archive_total_size": len(payload),
+                # Include the effective render config so workers never drift from
+                # the master's settings (Issue #4/#5 fix).
+                "runtime_config": {
+                    "overlap_percent": float(self.overlap_percent),
+                    "tile_coefficient": int(self.tile_coefficient),
+                    "max_retries": int(self.max_retries),
+                    "server_render_tiles": bool(self.server_render_tiles),
+                    "startup_mode": "worker",
+                },
             }
         finally:
             try:
@@ -1391,6 +1401,7 @@ class DistributedRenderManager:
                             "project_name": bundle["project_name"],
                             "blend_name": bundle["blend_name"],
                             "sync_context": bundle.get("sync_context", {}),
+                            "runtime_config": bundle.get("runtime_config", {}),
                             "total_size": total,
                             "total_chunks": total_chunks,
                             "sha256": bundle["sha256"],
@@ -1455,7 +1466,10 @@ class DistributedRenderManager:
 
         workers = self._active_worker_ids()
         if not workers:
-            self.last_error = "Keine aktiven Worker für Clean verbunden"
+            self.last_error = (
+                "Keine aktiven Worker verbunden. "
+                "Falls Worker gerade getrennt wurden, warte bis sie sich wieder verbinden."
+            )
             self.status = self.last_error
             return False
 
@@ -1564,6 +1578,21 @@ class DistributedRenderManager:
         self.pending_project_load_attempts = 0
         self.pending_project_load_retry_at = 0.0
 
+        # Apply effective runtime config sent by the master so workers don't
+        # drift from master's settings (Issue #4/#5 fix).
+        rc = transfer.get("runtime_config", {})
+        if isinstance(rc, dict) and rc:
+            if "overlap_percent" in rc:
+                self.overlap_percent = float(rc["overlap_percent"])
+            if "tile_coefficient" in rc:
+                self.tile_coefficient = int(rc["tile_coefficient"])
+            if "max_retries" in rc:
+                self.max_retries = int(rc["max_retries"])
+            if "server_render_tiles" in rc:
+                self.server_render_tiles = bool(rc["server_render_tiles"])
+            if rc.get("startup_mode") == "worker":
+                self.startup_mode = "worker"
+
         return {
             "ok": True,
             "transfer_id": transfer_id,
@@ -1671,9 +1700,19 @@ class DistributedRenderManager:
             self.job_attempts[tile["id"]] = 0
             self.job_queue.append(job)
 
-        # Prime each target with one job.
-        for target in self.dispatch_targets:
-            self._dispatch_next_job_for_target(target)
+        # Pre-distribute an initial batch of jobs to keep workers busy even
+        # when the timer-based dispatch loop has a short delay.  Each target
+        # receives up to `prefill` jobs so that a target finishing its first
+        # job always has a second one ready in its local send-buffer.
+        # A third of the total tiles (rounded up, min 1) is used as the burst
+        # budget to avoid over-filling small queues.
+        total_targets = max(1, len(self.dispatch_targets))
+        total_tiles = len(tiles)
+        burst_budget = max(1, (total_tiles + 2) // 3)  # ceil(total_tiles / 3)
+        prefill = max(1, burst_budget // total_targets)
+        for _ in range(prefill):
+            for target in self.dispatch_targets:
+                self._dispatch_next_job_for_target(target)
 
         self.status = f"Render gestartet: {len(tiles)} Tiles, {len(self.dispatch_targets)} Ziele"
         return True
@@ -1887,8 +1926,9 @@ class DistributedRenderManager:
         self.job_owner.pop(tile_id, None)
         if owner:
             self.target_inflight[owner] = max(0, int(self.target_inflight.get(owner, 1)) - 1)
-            # A finished target becomes immediately dispatch-eligible.
-            self.target_ready_at[owner] = time.time()
+            # Set ready_at to 0.0 so the guard `time.time() < target_ready_at` is always
+            # False, guaranteeing immediate re-dispatch eligibility (Issue #2 fix).
+            self.target_ready_at[owner] = 0.0
             self._dispatch_next_job_for_target(owner)
 
         done = len(self.completed_jobs)
@@ -2123,8 +2163,51 @@ class DistributedRenderManager:
 
         return True
 
-    def kick_all_workers(self):
+    def kick_all_workers(self, clean_first: bool = True):
+        """Disconnect all workers from the cluster.
+
+        Parameters
+        ----------
+        clean_first:
+            When True (the default) each worker receives a MSG_CLEAN_BLEND
+            command before the socket is closed, so that received .blend
+            copies are removed even though the worker will immediately
+            reconnect.  This avoids the "clean doesn't work after kick" bug
+            because the clean is performed *before* the connection is torn
+            down.
+        """
         ids = list(self.connected_workers.keys())
+        if not ids:
+            self.status = "Keine Worker verbunden"
+            return True
+
+        if clean_first and self._loop:
+            # Best-effort: send MSG_CLEAN_BLEND to every connected worker and
+            # wait briefly for acknowledgements before tearing down sockets.
+            async def _send_clean():
+                for worker_id in ids:
+                    info = self.connected_workers.get(worker_id)
+                    ws = info.get("socket") if info else None
+                    if ws:
+                        try:
+                            await ws.send(json_dumps({"type": MSG_CLEAN_BLEND}))
+                        except Exception:
+                            pass
+                # Give workers up to 3 s to process the clean command and
+                # send back their ACK before sockets are closed.
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if len(self.clean_results) >= len(ids):
+                        break
+                    await asyncio.sleep(0.1)
+
+            self.clean_results = {}
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_send_clean(), self._loop)
+                fut.result(timeout=5.0)
+            except Exception:
+                pass
+
         for worker_id in ids:
             info = self.connected_workers.get(worker_id)
             ws = info.get("socket") if info else None
@@ -2136,7 +2219,6 @@ class DistributedRenderManager:
             self.connected_workers.pop(worker_id, None)
             self.worker_sync_state = {}
             self.project_sync_results = {}
-            self.clean_results = {}
             self._defer_master_until_workers_primed = False
         self.status = f"Alle Worker getrennt ({len(ids)})"
         return True

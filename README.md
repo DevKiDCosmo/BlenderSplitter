@@ -1,16 +1,143 @@
-# BlenderSplitter - Full Recode Blueprint
+# BlenderSplitter
 
-This document describes how the add-on currently works in practice: discovery, sync, tile distribution, stitching, and clean-up.
+BlenderSplitter is a Blender add-on for distributed tile rendering across multiple machines on a local network.  One node acts as the **server** (scheduler + stitcher); all other nodes act as **workers** (tile render executors).  All nodes auto-discover each other via UDP broadcast — no manual IP configuration required.
 
-## 1. Goal and Scope
+## Quick Start
 
-BlenderSplitter is a distributed tile renderer for Blender:
+1. Install the ZIP from `dist/` in Blender → Preferences → Add-ons.
+2. Open the **Render** tab in the N-Panel (View3D sidebar).
+3. On every machine: click **Start Cluster**.
+4. On the master: click **Sync Project Files**, then **Distributed Render**.
+5. The stitched result appears in the configured Output Folder.
 
-- One node acts as `server` (scheduler + stitcher).
-- Multiple nodes act as `workers` (tile render executors).
-- All nodes auto-discover via UDP.
-- Tiles are rendered by region borders and returned to the server.
-- Server writes a run folder containing final image (`master`) and per-tile images (`raw-splits`).
+Build the add-on ZIP:
+
+```bash
+./compile.sh
+```
+
+---
+
+## Architecture
+
+### System Overview
+
+```mermaid
+graph TD
+    subgraph Blender["Blender Instance (any node)"]
+        UI["N-Panel UI
+(src/legacy/ui.py)"]
+        MGR["DistributedRenderManager
+(src/legacy/worker.py)"]
+        TIMER["bpy.app.timers
+(main thread queue pump)"]
+        LOOP["asyncio event loop
+(background thread)"]
+    end
+
+    subgraph Server["Server role"]
+        SCHED["Scheduler / Dispatch"]
+        STITCH["Stitch tiles → final PNG"]
+        SYNC_OUT["Project Sync (send)"]
+    end
+
+    subgraph Worker["Worker role"]
+        RENDER["Tile Render
+bpy.ops.render.render()"]
+        SYNC_IN["Project Sync (receive)"]
+    end
+
+    UI -->|operator calls| MGR
+    MGR --> TIMER
+    TIMER -->|process_main_thread_queues| MGR
+    MGR <-->|asyncio.run_coroutine_threadsafe| LOOP
+    LOOP --> SCHED
+    LOOP --> SYNC_OUT
+    LOOP --> SYNC_IN
+    LOOP --> RENDER
+    SCHED -->|WebSocket| Worker
+    Worker -->|tile result| Server
+    STITCH -->|final image| Filesystem
+```
+
+### Startup & Discovery Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Node A
+    participant B as Node B (or LAN)
+
+    A->>LAN: UDP discovery broadcast
+    LAN-->>A: (no reply – no server yet)
+    A->>A: Start WebSocket server (becomes server)
+    B->>LAN: UDP discovery broadcast
+    LAN-->>B: Reply from A (host, port)
+    B->>A: WebSocket connect + register_worker
+    A->>B: registered
+    Note over A,B: Cluster ready
+```
+
+### Distributed Render Flow
+
+```mermaid
+sequenceDiagram
+    participant M as Master (server)
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+
+    M->>M: Build tile plan (N tiles)
+    M->>W1: render_tile (tiles 0..k, pre-distributed batch)
+    M->>W2: render_tile (tiles k+1..m, pre-distributed batch)
+    M->>M: render_tile MASTER (local)
+    W1-->>M: tile_result (PNG)
+    W2-->>M: tile_result (PNG)
+    M->>M: tile_result (local queue)
+    Note over M: All tiles done
+    M->>M: stitch_tiles → final PNG
+```
+
+### Project Sync Flow
+
+```mermaid
+sequenceDiagram
+    participant M as Master
+    participant W as Worker
+
+    M->>M: Build ZIP (blend + assets + runtime_config)
+    M->>W: project_sync_start (metadata + runtime_config)
+    loop chunks
+        M->>W: project_sync_chunk
+    end
+    M->>W: project_sync_complete
+    W->>W: verify SHA-256, extract ZIP
+    W->>W: apply runtime_config (overlap, tiles, mode)
+    W->>W: schedule bpy.ops.wm.open_mainfile (main thread)
+    W-->>M: project_sync_ack
+```
+
+---
+
+## Module Map
+
+| Path | Purpose |
+|------|---------|
+| `src/legacy/worker.py` | `DistributedRenderManager` – all runtime logic |
+| `src/legacy/ui.py` | Blender operators, panels, N-Panel UI |
+| `src/legacy/network.py` | UDP discovery broadcast + responder |
+| `src/legacy/robust_connection.py` | Reconnect policy with backoff/failover |
+| `src/legacy/robust_protocol.py` | WebSocket message constants |
+| `src/legacy/robust_transfer.py` | Chunker / assembler for large tile results |
+| `src/legacy/tiles.py` | Tile generation and overlap calculations |
+| `src/legacy/stitch.py` | Tile compositing → final image |
+| `src/runtime/facade.py` | Public API used by UI; imports legacy manager |
+| `src/ui/controller.py` | UI routing layer over facade |
+| `src/scheduler/core.py` | Pure-Python scheduler state machine |
+| `src/sync/service.py` | Pure-Python sync bundle/chunk/ACK service |
+| `src/config/store.py` | Load/merge `config.json` |
+| `src/network/messages.py` | JSON serialisation helpers |
+| `src/blender_adapter/bpy_adapter.py` | Thin `bpy` wrapper for testability |
+
+---
 
 ## 2. Runtime Architecture
 

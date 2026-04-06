@@ -7,6 +7,14 @@ Consolidate all runtime logic under `src/`, remove unused root-level wrapper
 files from the ZIP distribution, and harden the codebase for security,
 maintainability, and readability.
 
+## Open GitHub Issues
+
+| # | Title | Status |
+|---|-------|--------|
+| 2 | Workers wait between jobs (scheduler cooldown) | **Fixed** – `target_ready_at` now set to `0.0` instead of `time.time()` |
+| 4 | Legacy manager loading + worker config drift + master responsiveness | **Fixed** – structured import diagnostics, `runtime_config` in sync bundle |
+| 5 | (same as #4, duplicate) | **Fixed** |
+
 ## Phases
 
 ### Phase 0 – Safety Baseline ✅
