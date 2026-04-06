@@ -30,9 +30,9 @@ def discover_server(discovery_port: int, timeout: float = 1.5) -> tuple[str, int
     sock.settimeout(timeout)
 
     try:
+        # "<broadcast>" is not a valid literal on Windows; use numeric addresses only.
         targets = [
             ("255.255.255.255", int(discovery_port)),
-            ("<broadcast>", int(discovery_port)),
             ("127.0.0.1", int(discovery_port)),
         ]
         for target in targets:
@@ -50,6 +50,10 @@ def discover_server(discovery_port: int, timeout: float = 1.5) -> tuple[str, int
 
             payload = decoded[len(DISCOVERY_REPLY) :]
             details = json.loads(payload)
+            # Ignore replies from incompatible server versions.
+            reply_version = details.get("version", "")
+            if reply_version and reply_version != "v3":
+                continue
             advertised_host = details.get("host")
             if advertised_host in (None, "", "127.0.0.1", "localhost", "0.0.0.0", "::1"):
                 host = str(addr[0])
@@ -69,11 +73,15 @@ class DiscoveryResponder:
         self.host = _best_local_ip()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Set to a non-empty string if the responder failed to start (e.g. port
+        # already bound).  Callers may surface this in the UI status field.
+        self.bind_error: str = ""
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self.bind_error = ""
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -86,7 +94,15 @@ class DiscoveryResponder:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("", self.discovery_port))
+            try:
+                # Bind to all interfaces intentionally so the responder receives
+                # broadcast packets regardless of which network interface the
+                # discovery client uses.  The responder only replies to valid
+                # DISCOVERY_MAGIC packets — it does not expose any sensitive data.
+                sock.bind(("", self.discovery_port))
+            except OSError as exc:
+                self.bind_error = f"DiscoveryResponder: UDP-Port {self.discovery_port} konnte nicht gebunden werden: {exc}"
+                return
             sock.settimeout(0.5)
 
             while not self._stop_event.is_set():
@@ -102,7 +118,7 @@ class DiscoveryResponder:
 
                 response = (
                     DISCOVERY_REPLY
-                    + json_dumps({"host": self.host, "port": self.websocket_port})
+                    + json_dumps({"host": self.host, "port": self.websocket_port, "version": "v3"})
                 ).encode("utf-8")
                 try:
                     _ = sock.sendto(response, addr)

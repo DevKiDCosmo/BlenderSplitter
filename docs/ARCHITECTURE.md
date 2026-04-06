@@ -14,6 +14,9 @@ Every node runs the **same ZIP** — the role (master vs worker) is determined
 dynamically at startup by the `startup_mode` configuration key and by the UDP
 discovery protocol.
 
+See [`SEQUENCE_DIAGRAMS.md`](./SEQUENCE_DIAGRAMS.md) for full protocol
+sequence diagrams.
+
 ---
 
 ## 2 Thread and Process Model
@@ -33,8 +36,9 @@ execution contexts**:
 │  │  ├─ consume progress queue      │                       │
 │  │  ├─ dequeue render tasks        │                       │
 │  │  │  └─ _render_tile_local()     │  ← synchronous render │
-│  │  └─ consume result queue        │                       │
-│  │     └─ _consume_tile_result()   │                       │
+│  │  ├─ consume result queue        │                       │
+│  │  │  └─ _consume_tile_result()   │                       │
+│  │  └─ stale-worker sweep (30s)    │  ← BUG-18 fix        │
 │  └──────────────┬──────────────────┘                       │
 │                 │ thread-safe queues                        │
 │  ┌──────────────▼──────────────────┐                       │
@@ -45,7 +49,8 @@ execution contexts**:
 │  │  ├─ WebSocket server            │  ← master only        │
 │  │  ├─ UDP discovery responder     │  ← master only        │
 │  │  ├─ WebSocket client            │  ← worker only        │
-│  │  └─ message send/receive        │                       │
+│  │  ├─ message send/receive        │                       │
+│  │  └─ parallel project sync       │  ← asyncio.gather    │
 │  └─────────────────────────────────┘                       │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -63,8 +68,8 @@ The solution is:
 
 | Context | What runs there | Communication |
 |---------|-----------------|---------------|
-| Main thread timer | Tile render (`bpy.ops`), stitch, result dispatch | `_task_queue`, `_result_queue`, `_progress_queue` |
-| asyncio thread | WebSocket server/client, UDP discovery, sync I/O | same queues + `asyncio.run_coroutine_threadsafe` |
+| Main thread timer | Tile render (`bpy.ops`), stitch, result dispatch, stale sweep | `_task_queue`, `_result_queue`, `_progress_queue` |
+| asyncio thread | WebSocket server/client, UDP discovery, parallel project sync | same queues + `asyncio.run_coroutine_threadsafe` |
 
 ### Current bottleneck (Issue #4/#5-C)
 
@@ -78,7 +83,7 @@ The asyncio thread continues to receive messages while the main thread is
 blocked, but it cannot dispatch new jobs to the master until the main-thread
 timer fires again.
 
-**Planned fix (Phase 5):** offload master tile renders to a subprocess — spawn
+**Planned fix (Phase 6):** offload master tile renders to a subprocess — spawn
 `blender --background --python render_tile_worker.py` and communicate via stdin
 / stdout or a temporary file.  The main thread timer becomes non-blocking, the
 asyncio thread can service workers continuously, and the master's throughput
@@ -100,12 +105,15 @@ matches workers'.
 ### Discovery protocol
 
 Discovery uses **UDP broadcast** on `discovery_port` (default 8766).
+The client uses `255.255.255.255` only (`"<broadcast>"` is not valid on Windows — BUG-13 fixed).
+The responder reply now includes a `"version": "v3"` field; clients skip replies
+from incompatible versions (BUG-22 fixed).
 
 ```
 Worker               LAN              Master
   │                                      │
   │── UDP broadcast: BLENDER_SPLITTER_DISCOVERY_V3 ──▶│
-  │                                      │── reply: BLENDER_SPLITTER_SERVER_V3{host, port} ──▶│
+  │                                      │── reply: {host, port, version:"v3"} ──▶│
   │◀──────────────────────────────────── │
   │── WebSocket connect ws://host:port ──▶│
   │                                      │
@@ -116,6 +124,9 @@ Worker               LAN              Master
 
 If **no reply** arrives within the timeout, the node self-hosts (unless it is
 configured as worker-only, in which case it retries indefinitely).
+
+The `DiscoveryResponder` now stores any port-bind failure in its `bind_error`
+attribute; the master surfaces this error in `status` (BUG-14 fixed).
 
 ---
 
@@ -155,7 +166,8 @@ After the takeover:
 
 ```
 start_distributed_render()
-  ├─ sync_project_to_workers()      (if auto_sync_project=True)
+  ├─ _sync_project_to_workers()     (if auto_sync_project=True)
+  │     └─ asyncio.gather(send chunks to all workers in parallel)
   ├─ run_integrity_check()           (render signature match)
   ├─ generate_tiles()                (grid split with overlap)
   ├─ queue job per tile
@@ -166,8 +178,28 @@ start_distributed_render()
             └─ worker: _render_tile_local() → MSG_TILE_RESULT
                          └─ master: _consume_tile_result()
                                      └─ (all done) → _finalize_render()
+                                                      ├─ tile audit pass
                                                       └─ stitch_tiles()
 ```
+
+### Parallel project sync (fixed)
+
+Previously `_sync_project_to_workers_async` sent each worker's chunk stream
+**sequentially** — total transfer time was `O(n × archive_size)`.
+
+After the fix it uses `asyncio.gather(*(_send_to_worker(wid) for wid in workers))` so all workers download **simultaneously** — total time is `O(archive_size)` bounded by the slowest link.
+
+### Tile audit pass (new)
+
+Before stitching, `_finalize_render` runs a **tile audit**:
+1. Collect all `tile_id`s from `job_attempts` that are absent from `completed_jobs`.
+2. If a tile is still in `pending_jobs`, call `_reassign_tile()` (retries up to `max_retries`).
+3. If a tile was lost without entering pending state, re-append its job to `job_queue`.
+4. If any tiles are still unresolved, return early — the dispatch loop continues.
+5. Only when all tiles are accounted for does stitching proceed.
+
+This ensures a render is never stitched with missing tiles, even if a worker
+died without triggering the normal disconnect handler.
 
 ### Batch camera
 
@@ -187,17 +219,40 @@ restarted between cameras.
 
 ---
 
-## 6 Sync Protocol
+## 6 Stale-Worker Expiry
 
-Project files (`.blend` + assets) are transferred **master → workers** before
+Workers are expected to send `MSG_HEARTBEAT` every 30 s (WebSocket ping interval).
+The master's timer callback calls `_purge_stale_workers()` every
+`STALE_WORKER_SWEEP_INTERVAL_S` (30 s).
+
+A worker is considered stale if `now - last_seen > STALE_WORKER_TIMEOUT_S` (90 s,
+i.e. 3 missed heartbeats).  Stale workers are treated identically to normal
+disconnects: their pending tiles are reassigned and they are removed from
+`connected_workers`.
+
+This closes the window where a worker hangs without dropping the TCP connection
+(e.g. OS-level keepalive not configured), leaving tiles perpetually in-flight
+and blocking `_finalize_render`.
+
+---
+
+## 7 Sync Protocol
+
+Project files (`.blend` + assets) are transferred **master → all workers simultaneously** before
 each distributed render when `auto_sync_project = True`.
 
 ```
-Master                           Worker
-  │── MSG_PROJECT_SYNC_START{transfer_id, total_size, sha256, runtime_config} ──▶│
-  │── MSG_PROJECT_SYNC_CHUNK{chunk_index, data_b64} ──▶│ (repeated)
-  │── MSG_PROJECT_SYNC_COMPLETE ──▶│
-  │                                │── MSG_PROJECT_SYNC_ACK{ok, received_bytes} ──▶│
+Master (asyncio.gather)          Worker 1          Worker 2
+  │── MSG_PROJECT_SYNC_START ──▶│                     │
+  │── MSG_PROJECT_SYNC_CHUNK × K─▶│                   │
+  │── MSG_PROJECT_SYNC_COMPLETE─▶│                    │
+  │                               │                   │
+  │── MSG_PROJECT_SYNC_START ────────────────────────▶│
+  │── MSG_PROJECT_SYNC_CHUNK × K ────────────────────▶│
+  │── MSG_PROJECT_SYNC_COMPLETE ──────────────────────▶│
+  │                               │                   │
+  │◀── MSG_PROJECT_SYNC_ACK ─────│                    │
+  │◀── MSG_PROJECT_SYNC_ACK ──────────────────────────│
 ```
 
 The `runtime_config` field in `MSG_PROJECT_SYNC_START` carries
@@ -206,14 +261,14 @@ and `startup_mode` to prevent configuration drift between nodes.
 
 ---
 
-## 7 Module Map
+## 8 Module Map
 
 | Path | Responsibility |
 |------|----------------|
 | `__init__.py` | Blender addon entry point; loads config, registers UI, auto-starts for dedicated modes |
 | `src/legacy/worker.py` | `DistributedRenderManager` — all runtime logic (server, worker, render, sync) |
 | `src/legacy/ui.py` | All Blender operator and panel classes |
-| `src/legacy/network.py` | UDP discovery (broadcast + responder) |
+| `src/legacy/network.py` | UDP discovery (broadcast + responder); BUG-13/14/22 fixed |
 | `src/legacy/robust_connection.py` | `ReconnectController` — exponential backoff policy |
 | `src/legacy/robust_protocol.py` | Message type constants |
 | `src/legacy/robust_transfer.py` | Tile chunking/assembly for large PNG results |
@@ -229,6 +284,7 @@ and `startup_mode` to prevent configuration drift between nodes.
 | `src/config/store.py` | JSON config loading/merging |
 | `src/blender_adapter/bpy_adapter.py` | Future concrete adapter isolating bpy calls |
 | `compile.sh` | Builds four per-mode ZIP artefacts |
+| `docs/SEQUENCE_DIAGRAMS.md` | Mermaid sequence diagrams for all protocol flows |
 
 Root-level `*.py` files (`network.py`, `worker.py`, `ui.py`, …) are **compatibility
 wrappers only** (`from .src.legacy.X import *`).  They are excluded from the
@@ -236,7 +292,7 @@ distribution ZIP by `compile.sh`.
 
 ---
 
-## 8 Configuration Keys (config.json)
+## 9 Configuration Keys (config.json)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -259,12 +315,15 @@ distribution ZIP by `compile.sh`.
 
 ---
 
-## 9 Known Limitations / Open Items
+## 10 Known Limitations / Open Items
 
-| ID | Area | Description |
-|----|------|-------------|
-| BUG-13 | Discovery | `"<broadcast>"` literal is invalid on Windows; use only `"255.255.255.255"` |
-| BUG-14 | Discovery | `DiscoveryResponder` silently stops if port is already bound |
-| BUG-18 | Workers | Stale workers not purged — `last_seen` tracked but no expiry sweep |
-| BUG-22 | Discovery | Discovery response has no version field — incompatible server versions silently accepted |
-| BUG-24 | Render | `_render_tile_local()` blocks Blender main thread (see §2 for planned fix) |
+| ID | Area | Status | Description |
+|----|------|--------|-------------|
+| BUG-13 | Discovery | **Fixed** | `"<broadcast>"` literal removed; using `"255.255.255.255"` only |
+| BUG-14 | Discovery | **Fixed** | `DiscoveryResponder.bind_error` surfaces port-bind failures |
+| BUG-18 | Workers | **Fixed** | Stale worker expiry sweep added (30s interval, 90s timeout) |
+| BUG-22 | Discovery | **Fixed** | `"version": "v3"` field added to responder reply; client validates |
+| BUG-24 | Render | **Open** | `_render_tile_local()` blocks Blender main thread (Phase 6 subprocess fix) |
+| BUG-26 | Sync | **Fixed** | Project sync was sequential; now uses `asyncio.gather` for parallel download |
+| BUG-27 | Render | **Fixed** | Tile audit pass added in `_finalize_render`; missing tiles are re-queued |
+

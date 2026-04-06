@@ -199,6 +199,13 @@ class DistributedRenderManager:
         self._batch_camera_queue: list[str] = []
         self._batch_camera_index: int = 0
 
+        # --- Stale-worker expiry (BUG-18 fix) --------------------------------
+        # Workers that haven't sent a heartbeat within STALE_WORKER_TIMEOUT_S
+        # seconds are disconnected during the periodic sweep.
+        self._stale_worker_sweep_at: float = 0.0
+        self.STALE_WORKER_TIMEOUT_S: float = 90.0   # 3 × heartbeat interval
+        self.STALE_WORKER_SWEEP_INTERVAL_S: float = 30.0
+
     def configure(
         self,
         host,
@@ -492,6 +499,11 @@ class DistributedRenderManager:
                 if self.target_inflight.get(target, 0) <= 0:
                     self._dispatch_next_job_for_target(target)
 
+        # Stale-worker expiry sweep (BUG-18 fix).
+        if self.role == "server" and time.time() >= self._stale_worker_sweep_at:
+            self._stale_worker_sweep_at = time.time() + self.STALE_WORKER_SWEEP_INTERVAL_S
+            self._purge_stale_workers()
+
     def _capture_sync_context(self, scene):
         render = scene.render
         camera_name = scene.camera.name if scene.camera else ""
@@ -778,8 +790,15 @@ class DistributedRenderManager:
         )
         self._discovery = DiscoveryResponder(self.discovery_port, self.server_port)
         self._discovery.start()
+        # Give the responder thread a moment to attempt binding, then surface
+        # any bind error in the status field (BUG-14 fix).
+        time.sleep(0.15)
+        if self._discovery.bind_error:
+            self.status = self._discovery.bind_error
+            self.last_error = self._discovery.bind_error
         self._server_ready.set()
-        self.status = f"Server aktiv auf {self.server_host}:{self.server_port}"
+        if not self._discovery.bind_error:
+            self.status = f"Server aktiv auf {self.server_host}:{self.server_port}"
 
     async def _connect_as_worker(self, host, port):
         host = str(host)
@@ -1496,24 +1515,30 @@ class DistributedRenderManager:
             return False
 
     async def _sync_project_to_workers_async(self, workers, bundle, timeout_seconds):
+        """Send the project bundle to all workers concurrently (parallel download).
+
+        All workers receive their chunk stream simultaneously via ``asyncio.gather``
+        so the total transfer time is bounded by the *slowest* single worker
+        rather than the sum of all workers.
+        """
         payload = bundle["payload"]
         total = len(payload)
         chunk_size = 256 * 1024
         total_chunks = (total + chunk_size - 1) // chunk_size if total else 1
         transfer_id = uuid.uuid4().hex
 
-        for worker_id in workers:
+        async def _send_to_worker(worker_id: str) -> None:
             info = self.connected_workers.get(worker_id)
             if not info:
                 self.project_sync_results[worker_id] = {"ok": False, "error": "worker missing"}
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "missing"
-                continue
+                return
 
             ws = info.get("socket")
             if ws is None:
                 self.project_sync_results[worker_id] = {"ok": False, "error": "socket missing"}
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "socket-missing"
-                continue
+                return
 
             try:
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "sending"
@@ -1560,6 +1585,9 @@ class DistributedRenderManager:
                 state = self.worker_sync_state.setdefault(worker_id, {})
                 state["phase"] = "failed"
                 state["error"] = str(exc)
+
+        # Dispatch all worker transfers concurrently (BUG: was sequential).
+        await asyncio.gather(*(_send_to_worker(wid) for wid in workers), return_exceptions=True)
 
         deadline = time.time() + float(timeout_seconds)
         while time.time() < deadline:
@@ -2062,6 +2090,45 @@ class DistributedRenderManager:
         if not self.current_render_config:
             return
 
+        # --- Tile audit pass -------------------------------------------
+        # Check for any tiles that are still pending or in the queue but
+        # were never completed (e.g. because their worker died without the
+        # disconnect handler firing).  Re-queue them so they are retried
+        # before stitching.
+        missing_ids = [
+            tid for tid in self.job_attempts
+            if tid not in self.completed_jobs
+        ]
+        # Build a set of tile_ids currently in job_queue once so we can
+        # check membership in O(1) rather than O(queue_size) per tile.
+        queued_ids: set = {j.get("tile_id") for j in self.job_queue}
+        for tile_id in missing_ids:
+            if tile_id in self.pending_jobs:
+                self._reassign_tile(tile_id, "Tile-Audit: kein Ergebnis empfangen")
+            elif tile_id in queued_ids:
+                pass  # still queued — will be dispatched normally
+            else:
+                # Job was lost without entering pending_jobs; re-enqueue it
+                job = next(
+                    (j for j in (list(self.pending_jobs.values()) + self.job_queue)
+                     if j.get("tile_id") == tile_id),
+                    None,
+                )
+                if job is not None:
+                    self.job_queue.append(job)
+                    queued_ids.add(tile_id)
+
+        # If the audit found missing tiles, abort stitching for now — the
+        # dispatch loop will keep running and call _finalize_render again.
+        still_pending = [
+            tid for tid in missing_ids if tid not in self.completed_jobs
+        ]
+        if still_pending or self.pending_jobs or self.job_queue:
+            self.status = (
+                f"Tile-Audit: {len(still_pending)} fehlende Tiles werden neu zugewiesen"
+            )
+            return
+
         try:
             stitch_tiles(
                 list(self.completed_jobs.values()),
@@ -2196,6 +2263,25 @@ class DistributedRenderManager:
 
         for target in list(self.dispatch_targets):
             self._dispatch_next_job_for_target(target)
+
+    def _purge_stale_workers(self) -> None:
+        """Disconnect workers that have not sent a heartbeat recently (BUG-18 fix).
+
+        Workers are expected to send MSG_HEARTBEAT every ~30 s (ping_interval).
+        Any worker whose ``last_seen`` timestamp is more than
+        ``STALE_WORKER_TIMEOUT_S`` seconds old is treated as dead: its pending
+        jobs are reassigned and it is removed from ``connected_workers``.
+        """
+        now = time.time()
+        stale = [
+            wid
+            for wid, info in list(self.connected_workers.items())
+            if now - float(info.get("last_seen", now)) > self.STALE_WORKER_TIMEOUT_S
+        ]
+        for worker_id in stale:
+            self._reassign_jobs_from_worker(worker_id)
+            self.connected_workers.pop(worker_id, None)
+            self.status = f"Staler Worker entfernt: {worker_id} ({len(self.connected_workers)} verbleibend)"
 
     def _reassign_tile(self, tile_id, reason):
         if tile_id not in self.pending_jobs:

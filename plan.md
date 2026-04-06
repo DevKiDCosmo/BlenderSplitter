@@ -39,16 +39,18 @@ maintainability, and readability.
 | BUG-19 | `src/legacy/ui.py` | "Update Information" / "Reset" buttons gated by `is_worker` — workers can't refresh state | Removed `row.enabled = not is_worker` gate from those buttons |
 | BUG-20 | `src/legacy/worker.py` | `sync_project_files()` calls `force_start_server()` when not server | Returns descriptive error instead |
 | BUG-25 | `src/legacy/worker.py` | `dispatch_cooldown_seconds = 1.0` field declared but never used (dead code) | Removed |
+| BUG-13 | `src/legacy/network.py` | `"<broadcast>"` literal not valid on Windows | Removed; using `"255.255.255.255"` only |
+| BUG-14 | `src/legacy/network.py` | `DiscoveryResponder` silently stops if discovery port already bound | `bind_error` attribute + surfaced in `status` |
+| BUG-18 | `src/legacy/worker.py` | Stale workers not purged — `last_seen` updated but no expiry timer | `_purge_stale_workers()` sweep every 30s, 90s timeout |
+| BUG-22 | `src/legacy/network.py` | Discovery response has no version field — incompatible servers silently accepted | `"version": "v3"` added to reply; client validates |
+| BUG-26 | `src/legacy/worker.py` | Project sync was sequential (O(n·size)); bottleneck on large clusters | `asyncio.gather` — all workers download in parallel |
+| BUG-27 | `src/legacy/worker.py` | No tile audit before stitch — missing tiles could leave holes in output | Tile audit pass in `_finalize_render`; re-queues missing tiles |
 
 ### Medium / Pending 🔲
 
 | ID | File | Description | Recommended Fix |
 |----|------|-------------|-----------------|
-| BUG-13 | `src/legacy/network.py` | `"<broadcast>"` literal not valid on Windows | Use only `"255.255.255.255"` and `"127.0.0.1"` |
-| BUG-14 | `src/legacy/worker.py` | `DiscoveryResponder` silently stops if discovery port already bound | Log/surface error in `status` |
-| BUG-18 | `src/legacy/worker.py` | Stale workers not purged — `last_seen` updated but no expiry timer | Add periodic sweep in `process_main_thread_queues` |
-| BUG-22 | `src/legacy/network.py` | Discovery response has no version field — incompatible servers silently accepted | Add `"version"` field to `DiscoveryResponder` reply |
-| BUG-24 | `src/legacy/worker.py` | `_render_tile_local` blocks Blender main thread | Needs subprocess render or post-frame handler (Phase 5) |
+| BUG-24 | `src/legacy/worker.py` | `_render_tile_local` blocks Blender main thread | Subprocess render (Phase 6) |
 
 ---
 
@@ -91,16 +93,27 @@ Dead `dispatch_cooldown_seconds` field removed.
 `docs/ARCHITECTURE.md` created documenting dual-thread model, startup modes, force server,
 render pipeline, sync protocol, module map, config keys.
 
+### Phase 4c – Async Sync, Stale Expiry, Discovery Hardening, Tile Audit ✅
+BUG-13: `"<broadcast>"` removed — discovery uses `255.255.255.255` only (Windows safe).
+BUG-14: `DiscoveryResponder.bind_error` surfaces port-bind failure in master `status`.
+BUG-18: `_purge_stale_workers()` sweep every 30s; 90s heartbeat timeout; jobs reassigned.
+BUG-22: `"version": "v3"` added to discovery reply; client skips incompatible replies.
+BUG-26: `_sync_project_to_workers_async` now uses `asyncio.gather` — all workers receive
+         chunks in parallel (from O(n·size) to O(size)).
+BUG-27: Tile audit pass in `_finalize_render` — any tile not in `completed_jobs` is
+         re-queued before stitching proceeds.
+`docs/SEQUENCE_DIAGRAMS.md` created with Mermaid diagrams for all protocol flows.
+`docs/ARCHITECTURE.md` updated.
+
 ### Phase 5 – Network/Adapter Extraction (pending)
 Implement concrete adapters for `src/network/ports.py`.
 Move reconnect/discovery policy into `src/network/`.
 Integrate `src/blender_adapter/bpy_adapter.py`.
-Fix BUG-13 (`"<broadcast>"` on Windows), BUG-14 (DiscoveryResponder port conflict).
 
 ### Phase 6 – Master Subprocess Render (pending)
 Offload master tile renders to a subprocess (`blender --background --python`).
 Main-thread timer becomes non-blocking; master throughput matches workers.
-No more 1-second dispatch stall between master tiles (BUG-24).
+No more dispatch stall between master tiles (BUG-24).
 
 ### Phase 7 – Startup and Composition Root (pending)
 Wire addon startup via `src/runtime` composition.
@@ -112,9 +125,8 @@ Remove `src/legacy/*` once parity + tests are green.
 
 ### Utils / Misc (pending)
 - `src/legacy/trans.py` — standalone CLI tool; document usage in README.
-- Stale worker expiry sweep (BUG-18).
-- Discovery version field (BUG-22).
-- Windows broadcast fix (BUG-13).
+- `src/legacy/stitch.py`: add overlap-crop option to avoid visible seams.
+- `compile.sh`: include `docs/` in ZIP optionally (for documentation bundles).
 
 ---
 

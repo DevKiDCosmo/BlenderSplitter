@@ -45,13 +45,18 @@ _Last updated: 2026-04-06_
 - [x] **`docs/ARCHITECTURE.md`**: Created — dual-thread model, startup modes, force server protocol, render pipeline (single + batch camera), sync protocol, module map, config reference, known limitations.
 - [x] **`plan.md`** updated with Phase 4b, Phase 5-8, Utils/Misc section, full bug audit table.
 
-## Pending 🔲
+### Phase 4c – Async Sync, Stale Expiry, Discovery Hardening, Tile Audit ✅ (2026-04-06)
+- [x] **BUG-13 Windows broadcast**: Removed `"<broadcast>"` literal from `network.py`; using `"255.255.255.255"` only.
+- [x] **BUG-14 DiscoveryResponder silent fail**: `bind_error` attribute added; master surfaces it in `status` after 150ms startup delay.
+- [x] **BUG-18 Stale worker expiry**: `_purge_stale_workers()` called every 30s in `process_main_thread_queues`; 90s heartbeat timeout; tiles reassigned on expiry.
+- [x] **BUG-22 Discovery version field**: `"version": "v3"` added to `DiscoveryResponder` reply; `discover_server()` skips replies with wrong version.
+- [x] **BUG-26 Sequential project sync**: `_sync_project_to_workers_async` now uses `asyncio.gather` — all workers download in parallel (O(size) instead of O(n·size)).
+- [x] **BUG-27 Missing tile audit**: `_finalize_render` now runs a tile audit pass before stitching; re-queues any tiles not in `completed_jobs`.
+- [x] **`docs/SEQUENCE_DIAGRAMS.md`**: Created — Mermaid diagrams for normal job distribution, worker failure/reassign, stale-worker expiry, parallel sync, sync failure, render finalization/tile audit, force-server takeover, UDP discovery, integrity check.
+- [x] **`docs/ARCHITECTURE.md`** updated: parallel sync, tile audit, stale expiry, discovery version/broadcast fixes, BUG table updated.
+- [x] **`plan.md`** updated: Phase 4c added, BUG-13/14/18/22 moved to fixed, BUG-26/27 added.
 
-### Short-term (High Priority)
-- [ ] **BUG-13 Windows broadcast**: `"<broadcast>"` literal fails on Windows. Change to `"255.255.255.255"` in `src/legacy/network.py`.
-- [ ] **BUG-14 DiscoveryResponder silent fail**: If UDP discovery port is already bound, `DiscoveryResponder._run` stops silently. Surface error in `status`.
-- [ ] **BUG-18 Stale worker expiry**: Workers whose `last_seen` heartbeat is too old are never removed. Add periodic sweep (every 30s) in `process_main_thread_queues`.
-- [ ] **BUG-22 Discovery version field**: `DiscoveryResponder` reply has no `version` key — incompatible instances silently accepted. Add version check.
+## Pending 🔲
 
 ### Short-term (Medium Priority)
 - [ ] **Camera selection**: UI for selecting which cameras appear in "Batch Cameras" (currently free-text). Add an enum/multi-select operator.
@@ -59,7 +64,7 @@ _Last updated: 2026-04-06_
 - [ ] **Smoke test script**: Executable E2E instructions.
 
 ### Medium-term
-- [ ] **Phase 5 – Network/Adapter Extraction**: Concrete adapters for `src/network/ports.py`; Windows broadcast fix; discovery version field.
+- [ ] **Phase 5 – Network/Adapter Extraction**: Concrete adapters for `src/network/ports.py`.
 - [ ] **Phase 6 – Master Subprocess Render**: Offload `_render_tile_local` to subprocess; fix BUG-24 (main-thread blocking).
 - [ ] **Phase 7 – Startup Composition Root**: Wire startup entirely via `src/runtime`.
 - [ ] **Phase 8 – Legacy Removal**: Remove root wrappers and `src/legacy/*` after parity confirmed.
@@ -74,3 +79,5 @@ _Last updated: 2026-04-06_
 - [ ] Tests for `runtime_config` propagation in sync bundle.
 - [ ] Tests for `MSG_NEW_MASTER` flow (takeover broadcast + worker reconnect).
 - [ ] Tests for batch camera render (mock `_render_batch_camera_at_index`, verify queue advance).
+- [ ] Tests for `_purge_stale_workers` (mock `last_seen`, verify reassignment).
+- [ ] Tests for parallel sync (verify `asyncio.gather` called, verify per-worker progress tracking).
