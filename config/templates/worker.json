@@ -1,0 +1,27 @@
+{
+    "mode": "worker",
+    "user_mode": "master_worker",
+    "always": [
+        "NETWORK"
+    ],
+    "network": {
+        "host": "0.0.0.0",
+        "server_port": 8765,
+        "discovery_port": 8766
+    },
+    "render": {
+        "overlap_percent": 3.0,
+        "max_retries": 3,
+        "auto_sync_project": true,
+        "show_render_window": true,
+        "server_render_tiles": true,
+        "tile_coefficient": 1,
+        "output_dir": ""
+    },
+    "external_scheduler": {
+        "enabled": false,
+        "script": "scheduler_app.py",
+        "host": "127.0.0.1",
+        "port": 9876
+    }
+}
