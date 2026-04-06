@@ -133,7 +133,6 @@ class DistributedRenderManager:
         self.job_queue = []
         self.target_inflight = {}
         self.target_ready_at = {}
-        self.dispatch_cooldown_seconds = 1.0
         self.dispatch_targets = []
         self._defer_master_until_workers_primed = False
 
@@ -187,10 +186,18 @@ class DistributedRenderManager:
         self._reconnect = ReconnectController(ReconnectPolicy(rediscover_after=3, self_host_after=8, max_sleep=3.0))
         self._worker_render_view_opened = False
         self._takeover_requested = False
-        # Stores {host, port} when a MSG_NEW_MASTER redirect is received.
-        # The worker reconnect loop checks this after each connection cycle
-        # and sleeps MSG_NEW_MASTER_DELAY_S before reconnecting to the new master.
+        # Stores the new master's address when a MSG_NEW_MASTER redirect is
+        # received: {'host': str, 'port': int}.  The worker reconnect loop
+        # checks this after each connection cycle and sleeps
+        # MSG_NEW_MASTER_DELAY_S before reconnecting to the new master.
         self._pending_new_master: dict | None = None
+
+        # --- Batch camera state -------------------------------------------
+        # When non-empty this list drives camera-by-camera sequential render:
+        #   start_batch_camera_render(cameras) → _finalize_render() triggers
+        #   _advance_batch_camera() → start_distributed_render() for next cam.
+        self._batch_camera_queue: list[str] = []
+        self._batch_camera_index: int = 0
 
     def configure(
         self,
@@ -1719,10 +1726,9 @@ class DistributedRenderManager:
 
     def start_distributed_render(self):
         if self.role != "server":
-            self.status = "Starte Server vor Render"
-            if not self.force_start_server():
-                self.last_error = self.status
-                return False
+            self.last_error = "Distributed Render setzt Server-Rolle voraus. Zuerst Cluster als Server starten."
+            self.status = self.last_error
+            return False
 
         scene = _safe_scene()
         if scene is None:
@@ -2071,6 +2077,113 @@ class DistributedRenderManager:
             self.status = self.last_error
             traceback.print_exc()
 
+        # Advance to the next camera in a batch render (if one is active).
+        self._advance_batch_camera()
+
+    # ------------------------------------------------------------------
+    # Batch camera render
+    # ------------------------------------------------------------------
+
+    def start_batch_camera_render(self, camera_names: list) -> bool:
+        """Start a sequential render across multiple cameras.
+
+        For each camera in *camera_names* the full tile-render + stitch
+        cycle runs in order.  The stitched result is saved to
+        ``<output_dir>/<camera_name>/distributed_render.png``.
+
+        After the last camera the batch ends and ``status`` is set to a
+        summary string.  Workers are never restarted between cameras —
+        only the scene camera is swapped between passes.
+
+        Returns ``True`` if the batch was queued, ``False`` on error.
+        """
+        if self.role != "server":
+            self.last_error = "Batch Render setzt Server-Rolle voraus."
+            self.status = self.last_error
+            return False
+        if not camera_names:
+            self.last_error = "Keine Kamera für Batch-Render angegeben."
+            self.status = self.last_error
+            return False
+
+        scene = _safe_scene()
+        if scene is None:
+            self.last_error = "Keine aktive Szene"
+            self.status = self.last_error
+            return False
+
+        # Validate cameras exist
+        valid: list[str] = []
+        for name in camera_names:
+            name = str(name).strip()
+            if not name:
+                continue
+            if name not in bpy.data.objects:
+                self.last_error = f"Kamera '{name}' nicht gefunden."
+                self.status = self.last_error
+                return False
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.type != "CAMERA":
+                self.last_error = f"Objekt '{name}' ist keine Kamera."
+                self.status = self.last_error
+                return False
+            valid.append(name)
+
+        if not valid:
+            self.last_error = "Keine gültigen Kameras gefunden."
+            self.status = self.last_error
+            return False
+
+        self._batch_camera_queue = valid
+        self._batch_camera_index = 0
+        self.status = f"Batch Render gestartet: {len(valid)} Kamera(s)"
+        return self._render_batch_camera_at_index()
+
+    def _render_batch_camera_at_index(self) -> bool:
+        """Set the active camera for the current batch index and start a render."""
+        idx = self._batch_camera_index
+        queue = self._batch_camera_queue
+        if idx >= len(queue):
+            return False
+
+        camera_name = queue[idx]
+        scene = _safe_scene()
+        if scene is None:
+            self.last_error = "Keine aktive Szene beim Batch-Wechsel"
+            self.status = self.last_error
+            self._batch_camera_queue = []
+            return False
+
+        obj = bpy.data.objects.get(camera_name)
+        if obj is None:
+            self.last_error = f"Kamera '{camera_name}' verschwunden"
+            self.status = self.last_error
+            self._batch_camera_queue = []
+            return False
+
+        scene.camera = obj
+        self.status = f"Batch Render Kamera {idx + 1}/{len(queue)}: {camera_name}"
+        return self.start_distributed_render()
+
+    def _advance_batch_camera(self) -> None:
+        """Called by _finalize_render to move to the next camera in the batch."""
+        if not self._batch_camera_queue:
+            return
+
+        self._batch_camera_index += 1
+        idx = self._batch_camera_index
+        total = len(self._batch_camera_queue)
+
+        if idx >= total:
+            # All cameras done
+            self._batch_camera_queue = []
+            self._batch_camera_index = 0
+            self.status = f"Batch Render abgeschlossen ({total} Kamera(s))"
+            return
+
+        # Kick off next camera's render
+        self._render_batch_camera_at_index()
+
     def _reassign_jobs_from_worker(self, worker_id):
         if worker_id in self.dispatch_targets:
             self.dispatch_targets = [t for t in self.dispatch_targets if t != worker_id]
@@ -2250,6 +2363,8 @@ class DistributedRenderManager:
             "tiles_chunked": 0,
             "chunk_messages": 0,
         }
+        self._batch_camera_queue = []
+        self._batch_camera_index = 0
 
         if hard:
             scene = _safe_scene()

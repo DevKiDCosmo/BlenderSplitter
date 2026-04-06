@@ -13,6 +13,9 @@ class SchedulerState:
         self.sync_progress = 0.0
         self.render_progress = 0.0
         self.status = "Idle"
+        self.shutdown_requested = False
+        # Set by main() so the UI kick button can schedule coroutines on it.
+        self.loop = None
 
 
 class SchedulerApp:
@@ -83,7 +86,17 @@ class SchedulerApp:
                 self.state.status = f"Worker disconnected: {len(self.state.workers)}"
 
 
-def start_desktop_ui(state: SchedulerState):
+def start_desktop_ui(state: SchedulerState, app: "SchedulerApp"):
+    """Launch the Tkinter desktop monitor window.
+
+    Displays:
+    * Status line and worker count
+    * Per-worker status table (worker ID, last status)
+    * Sync and Render progress bars
+    * Action buttons: Stop Scheduler, Kick All Workers
+
+    The window polls ``state`` every 250 ms for live updates.
+    """
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -91,30 +104,102 @@ def start_desktop_ui(state: SchedulerState):
         return
 
     root = tk.Tk()
-    root.title("BlenderSplitter Scheduler")
-    root.geometry("460x220")
+    root.title("BlenderSplitter – Cluster Monitor")
+    root.geometry("560x480")
+    root.resizable(True, True)
 
-    status_var = tk.StringVar(value="Starting...")
-    workers_var = tk.StringVar(value="Workers: 0")
+    # ── Top status strip ──────────────────────────────────────────────────
+    status_frame = ttk.LabelFrame(root, text="Status", padding=6)
+    status_frame.pack(fill="x", padx=10, pady=(8, 4))
+
+    status_var = tk.StringVar(value="Starting…")
+    workers_var = tk.StringVar(value="Workers online: 0")
+    ttk.Label(status_frame, textvariable=status_var, anchor="w").pack(fill="x")
+    ttk.Label(status_frame, textvariable=workers_var, anchor="w").pack(fill="x")
+
+    # ── Progress bars ─────────────────────────────────────────────────────
+    prog_frame = ttk.LabelFrame(root, text="Progress", padding=6)
+    prog_frame.pack(fill="x", padx=10, pady=4)
+
     sync_var = tk.DoubleVar(value=0.0)
     render_var = tk.DoubleVar(value=0.0)
 
-    ttk.Label(root, text="Scheduler Status").pack(anchor="w", padx=10, pady=(10, 2))
-    ttk.Label(root, textvariable=status_var).pack(anchor="w", padx=10)
-    ttk.Label(root, textvariable=workers_var).pack(anchor="w", padx=10, pady=(8, 2))
+    ttk.Label(prog_frame, text="Sync").grid(row=0, column=0, sticky="w", padx=(0, 6))
+    ttk.Progressbar(prog_frame, variable=sync_var, maximum=100.0, length=440).grid(row=0, column=1, sticky="ew")
+    ttk.Label(prog_frame, text="Render").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(4, 0))
+    ttk.Progressbar(prog_frame, variable=render_var, maximum=100.0, length=440).grid(row=1, column=1, sticky="ew", pady=(4, 0))
+    prog_frame.columnconfigure(1, weight=1)
 
-    ttk.Label(root, text="Sync Progress").pack(anchor="w", padx=10)
-    ttk.Progressbar(root, variable=sync_var, maximum=100.0, length=420).pack(anchor="w", padx=10)
+    # ── Worker table ──────────────────────────────────────────────────────
+    table_frame = ttk.LabelFrame(root, text="Connected Workers", padding=6)
+    table_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
-    ttk.Label(root, text="Render Progress").pack(anchor="w", padx=10, pady=(8, 0))
-    ttk.Progressbar(root, variable=render_var, maximum=100.0, length=420).pack(anchor="w", padx=10)
+    columns = ("worker_id", "status")
+    tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+    tree.heading("worker_id", text="Worker ID")
+    tree.heading("status", text="Last Status")
+    tree.column("worker_id", width=280, stretch=True)
+    tree.column("status", width=200, stretch=True)
+
+    vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+
+    # ── Action buttons ────────────────────────────────────────────────────
+    btn_frame = ttk.Frame(root, padding=6)
+    btn_frame.pack(fill="x", padx=10, pady=(4, 8))
+
+    def stop_scheduler():
+        state.shutdown_requested = True
+        root.after(300, root.destroy)
+
+    def kick_workers():
+        failed = []
+        for wid in list(state.workers.keys()):
+            ws = state.workers[wid].get("socket") if isinstance(state.workers.get(wid), dict) else None
+            if ws is not None:
+                try:
+                    import asyncio
+                    loop = state.loop
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(ws.close(), loop)
+                except Exception as exc:
+                    failed.append(wid)
+                    import logging
+                    logging.getLogger(__name__).debug("kick_workers: close failed for %s: %s", wid, exc)
+        state.workers.clear()
+        if failed:
+            state.status = f"Kick incomplete – {len(failed)} socket(s) failed to close"
+        else:
+            state.status = "All workers kicked"
+
+    ttk.Button(btn_frame, text="Stop Scheduler", command=stop_scheduler).pack(side="left", padx=4)
+    ttk.Button(btn_frame, text="Kick All Workers", command=kick_workers).pack(side="left", padx=4)
+
+    # ── Polling refresh ───────────────────────────────────────────────────
+    _prev_worker_keys: list = []
 
     def refresh():
         status_var.set(state.status)
-        workers_var.set(f"Workers: {len(state.workers)}")
+        workers_var.set(f"Workers online: {len(state.workers)}")
         sync_var.set(max(0.0, min(100.0, state.sync_progress)))
         render_var.set(max(0.0, min(100.0, state.render_progress)))
-        root.after(250, refresh)
+
+        # Rebuild worker table if the worker set changed
+        current_keys = sorted(state.workers.keys())
+        if current_keys != _prev_worker_keys:
+            _prev_worker_keys.clear()
+            _prev_worker_keys.extend(current_keys)
+            for item in tree.get_children():
+                tree.delete(item)
+            for wid in current_keys:
+                info = state.workers.get(wid, {})
+                last_status = str(info.get("last_status", "connected")) if isinstance(info, dict) else "connected"
+                tree.insert("", "end", values=(wid, last_status))
+
+        if not getattr(state, "shutdown_requested", False):
+            root.after(250, refresh)
 
     refresh()
     root.mainloop()
@@ -147,10 +232,17 @@ def main():
     port = int(scheduler_cfg.get("port", args.port))
 
     app = SchedulerApp(host=host, port=port)
-    ui_thread = threading.Thread(target=start_desktop_ui, args=(app.state,), daemon=True)
+
+    # Pass the asyncio event loop reference to state so the UI can schedule
+    # coroutines (e.g. kick-worker close calls) on it safely.
+    loop = asyncio.new_event_loop()
+    app.state.loop = loop
+
+    ui_thread = threading.Thread(target=start_desktop_ui, args=(app.state, app), daemon=True)
     ui_thread.start()
 
-    asyncio.run(app.run())
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(app.run())
 
 
 if __name__ == "__main__":

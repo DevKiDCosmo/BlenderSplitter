@@ -499,6 +499,61 @@ class BLENDERSPLITTER_OT_abort_render(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class BLENDERSPLITTER_OT_batch_camera_render(bpy.types.Operator):
+    bl_idname = "blendersplitter.batch_camera_render"
+    bl_label = "Batch Camera Render"
+    bl_description = (
+        "Render all tiles for each camera listed in 'Batch Cameras', stitch "
+        "after each pass, then advance to the next camera automatically."
+    )
+
+    @classmethod
+    def poll(cls, context):
+        mgr = _get_mgr()
+        if mgr is None:
+            return False
+        cfg = context.scene.blendersplitter_settings
+        cameras_raw = str(getattr(cfg, "batch_cameras", "") or "").strip()
+        return bool(mgr.started and mgr.role == "server" and cameras_raw)
+
+    def execute(self, context):
+        _apply_runtime_controller_config(context)
+        cfg = context.scene.blendersplitter_settings
+        cameras_raw = str(getattr(cfg, "batch_cameras", "") or "").strip()
+        if not cameras_raw:
+            self.report({"ERROR"}, "Keine Kameras angegeben (Batch Cameras Feld leer)")
+            return {"CANCELLED"}
+
+        camera_names = [c.strip() for c in cameras_raw.split(",") if c.strip()]
+        mgr = _get_mgr()
+        if mgr is None:
+            self.report({"ERROR"}, "Manager nicht verfügbar")
+            return {"CANCELLED"}
+
+        ok = mgr.start_batch_camera_render(camera_names)
+        if not ok:
+            self.report({"ERROR"}, _ui_controller.last_error() or "Batch Render fehlgeschlagen")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Batch Render gestartet: {len(camera_names)} Kamera(s)")
+        return {"FINISHED"}
+
+
+class BLENDERSPLITTER_OT_abort_render(bpy.types.Operator):
+    bl_idname = "blendersplitter.abort_render"
+    bl_label = "Abort Render"
+
+    def execute(self, context):
+        _apply_runtime_controller_config(context)
+        prev_error = _ui_controller.last_error()
+        _ui_controller.cancel_render()
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Render abgebrochen")
+        return {"FINISHED"}
+
+
 class BLENDERSPLITTER_OT_kick_all(bpy.types.Operator):
     bl_idname = "blendersplitter.kick_all"
     bl_label = "Kick All Workers"
@@ -661,6 +716,13 @@ class BLENDERSPLITTER_PG_settings_v2(bpy.types.PropertyGroup):
     show_render_window: bpy.props.BoolProperty(name="Show Render Window", default=True, update=_settings_updated)
     server_render_tiles: bpy.props.BoolProperty(name="Server Render Tiles", default=True, update=_settings_updated)
     output_dir: bpy.props.StringProperty(name="Output Folder", subtype="DIR_PATH", default="", update=_settings_updated)
+    # Batch camera: comma-separated camera names.  Leave blank for single-camera render.
+    batch_cameras: bpy.props.StringProperty(
+        name="Batch Cameras",
+        description="Comma-separated camera names for sequential batch render. Leave blank for single-camera render.",
+        default="",
+        update=_settings_updated,
+    )
 
 
 class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
@@ -766,6 +828,15 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row = layout.row()
         row.enabled = not is_worker
         row.operator("blendersplitter.distributed_render", icon="RENDER_STILL")
+
+        # Batch camera render
+        row = layout.row()
+        row.enabled = not is_worker
+        row.prop(cfg, "batch_cameras", icon="CAMERA_DATA")
+
+        row = layout.row()
+        row.enabled = not is_worker
+        row.operator("blendersplitter.batch_camera_render", icon="CAMERA_DATA")
 
         row = layout.row(align=True)
         row.enabled = not is_worker
@@ -879,6 +950,7 @@ CLASSES = (
     BLENDERSPLITTER_OT_sync_project_files,
     BLENDERSPLITTER_OT_dry_run_integrity,
     BLENDERSPLITTER_OT_distributed_render,
+    BLENDERSPLITTER_OT_batch_camera_render,
     BLENDERSPLITTER_OT_abort_render,
     BLENDERSPLITTER_OT_kick_all,
     BLENDERSPLITTER_OT_toggle_preview_overlay,

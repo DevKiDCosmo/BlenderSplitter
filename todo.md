@@ -19,7 +19,6 @@ _Last updated: 2026-04-06_
 - [x] **UI consistency**: Sync/Clean row changed to `align=True`; row disabled when no workers connected; hint label added.
 - [x] **Pre-distribution**: `start_distributed_render` pre-distributes up to `ceil(tiles/3)/targets` jobs per target at the start.
 - [x] **README.md**: Added Mermaid architecture/startup/render/sync flow diagrams, Module Map table, Quick Start.
-- [x] `plan.md` and `todo.md` created and kept up to date.
 
 ### Phase 3 – Force Server & Connection Stability ✅ (2026-04-06)
 - [x] **BUG-01 Force Server no poll()**: Added `poll()` to `BLENDERSPLITTER_OT_start_server`; button enabled only when `role == "worker"`.
@@ -34,25 +33,44 @@ _Last updated: 2026-04-06_
 - [x] **BUG-12/17 JSON parse crash in `_handle_worker_socket`**: Added `try/except` around `json.loads(raw)`.
 - [x] **BUG-16 `_worker_socket` not cleared on disconnect**: Set `self._worker_socket = None` after `async with` context exits.
 - [x] **BUG-19 Update Information disabled for workers**: Removed `row.enabled = not is_worker` gate from Update Information/Reset row.
-- [x] **sync_project_files wrong fallback**: Removed invalid `force_start_server()` call; returns error if not server.
-- [x] Config templates updated: `worker.json` sets `server_render_tiles: false`; `always` arrays cleared (mode-based auto-start now sufficient).
+- [x] **BUG-20 `sync_project_files` wrong fallback**: Returns error if not server.
+- [x] Config templates updated.
+
+### Phase 4b – Batch Camera, Monitor, Docs ✅ (2026-04-06)
+- [x] **BUG-15 `start_distributed_render` wrong fallback**: Removed `force_start_server()` call when not server; returns error instead.
+- [x] **BUG-25 Dead `dispatch_cooldown_seconds` field**: Removed.
+- [x] **Batch camera render**: `start_batch_camera_render(camera_names)` + `_render_batch_camera_at_index()` + `_advance_batch_camera()` in `worker.py`.
+- [x] **Batch camera UI**: `batch_cameras` property + `BLENDERSPLITTER_OT_batch_camera_render` operator in `ui.py`.
+- [x] **Scheduler Monitor UI**: Enhanced Tkinter app in `scheduler_app.py` — worker table, Stop Scheduler, Kick All Workers, loop reference for async kick.
+- [x] **`docs/ARCHITECTURE.md`**: Created — dual-thread model, startup modes, force server protocol, render pipeline (single + batch camera), sync protocol, module map, config reference, known limitations.
+- [x] **`plan.md`** updated with Phase 4b, Phase 5-8, Utils/Misc section, full bug audit table.
 
 ## Pending 🔲
 
-### Short-term
-- [ ] **Master render responsiveness** (Issue #4/#5-C): local tile render at master blocks Blender's main thread (`bpy.ops.render.render()` is synchronous). Needs subprocess render or async render via post-frame handler.
-- [ ] **Camera selection**: Batch render camera selection UI.
-- [ ] **UI status for master-defer**: Label when master is in worker-priming phase.
+### Short-term (High Priority)
+- [ ] **BUG-13 Windows broadcast**: `"<broadcast>"` literal fails on Windows. Change to `"255.255.255.255"` in `src/legacy/network.py`.
+- [ ] **BUG-14 DiscoveryResponder silent fail**: If UDP discovery port is already bound, `DiscoveryResponder._run` stops silently. Surface error in `status`.
+- [ ] **BUG-18 Stale worker expiry**: Workers whose `last_seen` heartbeat is too old are never removed. Add periodic sweep (every 30s) in `process_main_thread_queues`.
+- [ ] **BUG-22 Discovery version field**: `DiscoveryResponder` reply has no `version` key — incompatible instances silently accepted. Add version check.
+
+### Short-term (Medium Priority)
+- [ ] **Camera selection**: UI for selecting which cameras appear in "Batch Cameras" (currently free-text). Add an enum/multi-select operator.
+- [ ] **UI status for master-defer**: Show a label when master is in worker-priming phase.
 - [ ] **Smoke test script**: Executable E2E instructions.
-- [ ] **Stale worker cleanup**: Workers whose `last_seen` heartbeat exceeds a threshold should be auto-removed from `connected_workers`.
-- [ ] **Discovery port conflict detection**: `DiscoveryResponder._run` catches `OSError` and silently stops — log or surface this condition so server is discoverable.
 
 ### Medium-term
-- [ ] **Phase 5 – Network/Adapter Extraction**: Concrete adapters for `src/network/ports.py`.
-- [ ] **Phase 6 – Startup Composition Root**: Wire startup entirely via `src/runtime`.
-- [ ] **Phase 7 – Legacy Removal**: Remove root wrappers and `src/legacy/*` after parity confirmed.
+- [ ] **Phase 5 – Network/Adapter Extraction**: Concrete adapters for `src/network/ports.py`; Windows broadcast fix; discovery version field.
+- [ ] **Phase 6 – Master Subprocess Render**: Offload `_render_tile_local` to subprocess; fix BUG-24 (main-thread blocking).
+- [ ] **Phase 7 – Startup Composition Root**: Wire startup entirely via `src/runtime`.
+- [ ] **Phase 8 – Legacy Removal**: Remove root wrappers and `src/legacy/*` after parity confirmed.
+
+### Utils / Misc
+- [ ] Document `src/legacy/trans.py` CLI usage in README (black-pixel transparency tool).
+- [ ] `src/legacy/stitch.py`: add overlap-crop option to avoid visible seams.
+- [ ] `compile.sh`: include `docs/` in ZIP optionally (for documentation bundles).
 
 ### Testing
 - [ ] Tests for `clean_worker_blends` and `sync_project_files` with mocked sockets.
 - [ ] Tests for `runtime_config` propagation in sync bundle.
 - [ ] Tests for `MSG_NEW_MASTER` flow (takeover broadcast + worker reconnect).
+- [ ] Tests for batch camera render (mock `_render_batch_camera_at_index`, verify queue advance).
