@@ -25,6 +25,8 @@ from .robust_protocol import (
     MSG_HEARTBEAT,
     MSG_INTEGRITY_PROBE,
     MSG_INTEGRITY_RESULT,
+    MSG_NEW_MASTER,
+    MSG_NEW_MASTER_DELAY_S,
     MSG_PING,
     MSG_PROJECT_SYNC_ACK,
     MSG_PROJECT_SYNC_CHUNK,
@@ -131,7 +133,6 @@ class DistributedRenderManager:
         self.job_queue = []
         self.target_inflight = {}
         self.target_ready_at = {}
-        self.dispatch_cooldown_seconds = 1.0
         self.dispatch_targets = []
         self._defer_master_until_workers_primed = False
 
@@ -185,6 +186,25 @@ class DistributedRenderManager:
         self._reconnect = ReconnectController(ReconnectPolicy(rediscover_after=3, self_host_after=8, max_sleep=3.0))
         self._worker_render_view_opened = False
         self._takeover_requested = False
+        # Stores the new master's address when a MSG_NEW_MASTER redirect is
+        # received: {'host': str, 'port': int}.  The worker reconnect loop
+        # checks this after each connection cycle and sleeps
+        # MSG_NEW_MASTER_DELAY_S before reconnecting to the new master.
+        self._pending_new_master: dict | None = None
+
+        # --- Batch camera state -------------------------------------------
+        # When non-empty this list drives camera-by-camera sequential render:
+        #   start_batch_camera_render(cameras) → _finalize_render() triggers
+        #   _advance_batch_camera() → start_distributed_render() for next cam.
+        self._batch_camera_queue: list[str] = []
+        self._batch_camera_index: int = 0
+
+        # --- Stale-worker expiry (BUG-18 fix) --------------------------------
+        # Workers that haven't sent a heartbeat within STALE_WORKER_TIMEOUT_S
+        # seconds are disconnected during the periodic sweep.
+        self._stale_worker_sweep_at: float = 0.0
+        self.STALE_WORKER_TIMEOUT_S: float = 90.0   # 3 × heartbeat interval
+        self.STALE_WORKER_SWEEP_INTERVAL_S: float = 30.0
 
     def configure(
         self,
@@ -346,9 +366,24 @@ class DistributedRenderManager:
             except RuntimeError:
                 pass
 
+    def set_force_server(self, enabled: bool) -> None:
+        """No-op compatibility stub (force-start is handled via force_start_server())."""
+
     def force_start_server(self):
-        if not self.started:
-            self.start()
+        """Request server-role takeover from the current master.
+
+        Only callable when this node is already connected to an existing server
+        (i.e., ``self.role == "worker"`` and a worker socket is open).  Calling
+        it in any other state is a no-op that returns ``False`` with an error
+        message, so the UI poll() guard can safely map directly to this check.
+        """
+        if self.role != "worker" or self._worker_socket is None:
+            self.last_error = (
+                "Force Server ist nur möglich, wenn dieser Knoten als Worker "
+                "mit einem bestehenden Master verbunden ist."
+            )
+            self.status = self.last_error
+            return False
         if not self._loop_ready.wait(timeout=3.0):
             self.last_error = "Loop nicht bereit"
             self.status = self.last_error
@@ -359,6 +394,7 @@ class DistributedRenderManager:
             _ = fut.result(timeout=8.0)
             return True
         except Exception as exc:
+            self._takeover_requested = False
             self.last_error = str(exc)
             self.status = f"Force server fehlgeschlagen: {exc}"
             return False
@@ -462,6 +498,11 @@ class DistributedRenderManager:
             for target in list(self.dispatch_targets):
                 if self.target_inflight.get(target, 0) <= 0:
                     self._dispatch_next_job_for_target(target)
+
+        # Stale-worker expiry sweep (BUG-18 fix).
+        if self.role == "server" and time.time() >= self._stale_worker_sweep_at:
+            self._stale_worker_sweep_at = time.time() + self.STALE_WORKER_SWEEP_INTERVAL_S
+            self._purge_stale_workers()
 
     def _capture_sync_context(self, scene):
         render = scene.render
@@ -638,16 +679,37 @@ class DistributedRenderManager:
         self.status = f"Mode: {mode}"
 
         if mode == "master":
-            self.status = "Mode master: starting local server"
+            # Master mode: search for an existing server first; only become
+            # server if none is found (requirement: "Master first search for
+            # another master. If no exist it automatically make itself present.").
+            self.status = "Mode master: Suche nach bestehendem Server..."
+            found = discover_server(self.discovery_port, timeout=1.5)
+            if found:
+                host, port = found
+                self.role = "worker"
+                self.status = f"Mode master: Server gefunden {host}:{port}, verbinde als Worker"
+                await self._connect_as_worker(host, port)
+                return
+            self.status = "Mode master: Kein Server gefunden, starte lokalen Server"
             await self._start_server()
             return
 
         if mode == "master_worker":
-            self.status = "Mode master_worker: starting local server"
+            # Master-Worker mode: search first, become server if none found.
+            self.status = "Mode master_worker: Suche nach bestehendem Server..."
+            found = discover_server(self.discovery_port, timeout=1.5)
+            if found:
+                host, port = found
+                self.role = "worker"
+                self.status = f"Server gefunden: {host}:{port}"
+                await self._connect_as_worker(host, port)
+                return
+            self.status = "Mode master_worker: Kein Server gefunden, starte lokalen Server"
             await self._start_server()
             return
 
         if mode == "worker":
+            # Worker mode: search indefinitely — never becomes server.
             self.status = "Mode worker: searching for server"
             while not self._stop_event.is_set():
                 found = discover_server(self.discovery_port, timeout=1.5)
@@ -660,6 +722,7 @@ class DistributedRenderManager:
                 await asyncio.sleep(0.8)
             return
 
+        # "user" mode (or unknown): 6 attempts then fall back to self-hosting.
         self.status = "Searching server..."
         for attempt in range(6):
             found = discover_server(self.discovery_port, timeout=1.5)
@@ -727,8 +790,15 @@ class DistributedRenderManager:
         )
         self._discovery = DiscoveryResponder(self.discovery_port, self.server_port)
         self._discovery.start()
+        # Give the responder thread a moment to attempt binding, then surface
+        # any bind error in the status field (BUG-14 fix).
+        time.sleep(0.15)
+        if self._discovery.bind_error:
+            self.status = self._discovery.bind_error
+            self.last_error = self._discovery.bind_error
         self._server_ready.set()
-        self.status = f"Server aktiv auf {self.server_host}:{self.server_port}"
+        if not self._discovery.bind_error:
+            self.status = f"Server aktiv auf {self.server_host}:{self.server_port}"
 
     async def _connect_as_worker(self, host, port):
         host = str(host)
@@ -778,17 +848,24 @@ class DistributedRenderManager:
                             except Exception:
                                 # ignore invalid messages but keep connection alive
                                 continue
-                            await self._handle_worker_message(ws, msg)
+                            # _handle_worker_message returns True when the inner
+                            # loop should be broken (e.g. MSG_NEW_MASTER redirect).
+                            if await self._handle_worker_message(ws, msg):
+                                break
                     except (ConnectionClosedError, ConnectionClosedOK):
                         # normal disconnects handled by outer reconnect loop
                         pass
+                # Context-manager exit closes the socket; reset the cached ref.
+                self._worker_socket = None
             except InvalidHandshake as exc:
                 # Handshake failed — likely wrong URL/port or incompatible server
+                self._worker_socket = None
                 err = str(exc)
                 self.last_error = err
                 self._reconnect.on_failure()
                 self.status = f"Handshake fehlgeschlagen: {err}"
             except Exception as exc:
+                self._worker_socket = None
                 if self._takeover_requested:
                     self._takeover_requested = False
                     return
@@ -816,6 +893,21 @@ class DistributedRenderManager:
 
                 await asyncio.sleep(self._reconnect.sleep_seconds())
 
+            # --- Handle new-master redirect (MSG_NEW_MASTER) ---
+            if self._pending_new_master is not None:
+                pending = self._pending_new_master
+                self._pending_new_master = None
+                self.status = (
+                    f"Neuer Master: {pending['host']}:{pending['port']} "
+                    f"(warte {MSG_NEW_MASTER_DELAY_S:.0f}s)"
+                )
+                await asyncio.sleep(MSG_NEW_MASTER_DELAY_S)
+                host = pending["host"]
+                port = pending["port"]
+                url = f"ws://{host}:{port}"
+                self._reconnect.reset()
+                continue  # reconnect to the new master
+
             if self._takeover_requested:
                 self._takeover_requested = False
                 return
@@ -826,7 +918,11 @@ class DistributedRenderManager:
             async for raw in websocket:
                 if isinstance(raw, (bytes, bytearray)):
                     continue
-                msg = json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # Malformed message — keep connection alive, don't crash handler
+                    continue
                 msg_type = msg.get("type")
 
                 if msg_type == MSG_REGISTER_WORKER:
@@ -841,6 +937,27 @@ class DistributedRenderManager:
                     continue
 
                 if msg_type == MSG_SERVER_TAKEOVER:
+                    new_host = msg.get("new_host", "") or _local_ip()
+                    new_port = int(msg.get("new_port", self.server_port) or self.server_port)
+
+                    # Broadcast MSG_NEW_MASTER to ALL remaining connected workers
+                    # so they know where to reconnect after the takeover.
+                    redirect_payload = json_dumps({
+                        "type": MSG_NEW_MASTER,
+                        "new_host": str(new_host),
+                        "new_port": int(new_port),
+                    })
+                    for wid, info in list(self.connected_workers.items()):
+                        if wid == worker_id:
+                            continue
+                        ws_other = info.get("socket") if info else None
+                        if ws_other is not None:
+                            try:
+                                await ws_other.send(redirect_payload)
+                            except Exception:
+                                pass
+
+                    # Release the requesting worker
                     if worker_id and worker_id in self.connected_workers:
                         self._reassign_jobs_from_worker(worker_id)
                         self.connected_workers.pop(worker_id, None)
@@ -848,7 +965,7 @@ class DistributedRenderManager:
                         await websocket.close()
                     except Exception:
                         pass
-                    self.status = "Worker released by force server"
+                    self.status = "Server-Takeover: neuer Master übernimmt Kontrolle"
                     return
 
                 if msg_type == MSG_CLEAN_BLEND_ACK:
@@ -896,8 +1013,34 @@ class DistributedRenderManager:
                 del self.connected_workers[worker_id]
                 self.status = f"Worker disconnected: {len(self.connected_workers)}"
 
-    async def _handle_worker_message(self, websocket, msg):
+    async def _handle_worker_message(self, websocket, msg) -> bool:
+        """Handle a message received by a worker from its connected server.
+
+        Returns ``True`` when the inner message-receive loop should be broken
+        (e.g. after receiving ``MSG_NEW_MASTER``).  Returns ``False`` (or
+        implicitly ``None``) for normal messages.
+        """
         msg_type = msg.get("type")
+
+        # -------------------------------------------------------------------
+        # MSG_NEW_MASTER: old master redirecting us to a new server.
+        # Store the target, break the inner loop, sleep MSG_NEW_MASTER_DELAY_S,
+        # then reconnect to the new host in _connect_as_worker's outer loop.
+        # -------------------------------------------------------------------
+        if msg_type == MSG_NEW_MASTER:
+            new_host = str(msg.get("new_host", "") or "")
+            new_port_raw = msg.get("new_port", 0)
+            try:
+                new_port = int(new_port_raw)
+            except (TypeError, ValueError):
+                new_port = 0
+            if new_host and new_port:
+                self._pending_new_master = {"host": new_host, "port": new_port}
+                self.status = (
+                    f"Neuer Master angekündigt: {new_host}:{new_port} "
+                    f"(Verbinden in {MSG_NEW_MASTER_DELAY_S:.0f}s)"
+                )
+            return True  # break inner loop
 
         if msg_type == MSG_CLEAN_BLEND:
             # Server requested worker to remove any received .blend copies
@@ -1009,6 +1152,7 @@ class DistributedRenderManager:
                 "project_name": msg.get("project_name", "project"),
                 "blend_name": msg.get("blend_name", ""),
                 "sync_context": msg.get("sync_context", {}),
+                "runtime_config": msg.get("runtime_config", {}),
                 "total_size": int(msg.get("total_size", 0)),
                 "total_chunks": int(msg.get("total_chunks", 0)),
                 "sha256": msg.get("sha256", ""),
@@ -1097,7 +1241,7 @@ class DistributedRenderManager:
                 self.sync_active = False
                 self.last_error = f"Projekt-Sync Fehler: {exc}"
                 self.status = self.last_error
-            return
+            return False
 
     def _render_tile_local(self, payload):
         if self.render_abort_requested:
@@ -1305,6 +1449,15 @@ class DistributedRenderManager:
                 "file_count": len(file_map),
                 "source_total_size": total_source_size,
                 "archive_total_size": len(payload),
+                # Include the effective render config so workers never drift from
+                # the master's settings (Issue #4/#5 fix).
+                "runtime_config": {
+                    "overlap_percent": float(self.overlap_percent),
+                    "tile_coefficient": int(self.tile_coefficient),
+                    "max_retries": int(self.max_retries),
+                    "server_render_tiles": bool(self.server_render_tiles),
+                    "startup_mode": "worker",
+                },
             }
         finally:
             try:
@@ -1362,24 +1515,30 @@ class DistributedRenderManager:
             return False
 
     async def _sync_project_to_workers_async(self, workers, bundle, timeout_seconds):
+        """Send the project bundle to all workers concurrently (parallel download).
+
+        All workers receive their chunk stream simultaneously via ``asyncio.gather``
+        so the total transfer time is bounded by the *slowest* single worker
+        rather than the sum of all workers.
+        """
         payload = bundle["payload"]
         total = len(payload)
         chunk_size = 256 * 1024
         total_chunks = (total + chunk_size - 1) // chunk_size if total else 1
         transfer_id = uuid.uuid4().hex
 
-        for worker_id in workers:
+        async def _send_to_worker(worker_id: str) -> None:
             info = self.connected_workers.get(worker_id)
             if not info:
                 self.project_sync_results[worker_id] = {"ok": False, "error": "worker missing"}
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "missing"
-                continue
+                return
 
             ws = info.get("socket")
             if ws is None:
                 self.project_sync_results[worker_id] = {"ok": False, "error": "socket missing"}
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "socket-missing"
-                continue
+                return
 
             try:
                 self.worker_sync_state.setdefault(worker_id, {})["phase"] = "sending"
@@ -1391,6 +1550,7 @@ class DistributedRenderManager:
                             "project_name": bundle["project_name"],
                             "blend_name": bundle["blend_name"],
                             "sync_context": bundle.get("sync_context", {}),
+                            "runtime_config": bundle.get("runtime_config", {}),
                             "total_size": total,
                             "total_chunks": total_chunks,
                             "sha256": bundle["sha256"],
@@ -1426,6 +1586,9 @@ class DistributedRenderManager:
                 state["phase"] = "failed"
                 state["error"] = str(exc)
 
+        # Dispatch all worker transfers concurrently (BUG: was sequential).
+        await asyncio.gather(*(_send_to_worker(wid) for wid in workers), return_exceptions=True)
+
         deadline = time.time() + float(timeout_seconds)
         while time.time() < deadline:
             if len(self.project_sync_results) >= len(workers):
@@ -1455,7 +1618,10 @@ class DistributedRenderManager:
 
         workers = self._active_worker_ids()
         if not workers:
-            self.last_error = "Keine aktiven Worker für Clean verbunden"
+            self.last_error = (
+                "Keine aktiven Worker verbunden. "
+                "Falls Worker gerade getrennt wurden, warte bis sie sich wieder verbinden."
+            )
             self.status = self.last_error
             return False
 
@@ -1564,6 +1730,21 @@ class DistributedRenderManager:
         self.pending_project_load_attempts = 0
         self.pending_project_load_retry_at = 0.0
 
+        # Apply effective runtime config sent by the master so workers don't
+        # drift from master's settings (Issue #4/#5 fix).
+        rc = transfer.get("runtime_config", {})
+        if isinstance(rc, dict) and rc:
+            if "overlap_percent" in rc:
+                self.overlap_percent = float(rc["overlap_percent"])
+            if "tile_coefficient" in rc:
+                self.tile_coefficient = int(rc["tile_coefficient"])
+            if "max_retries" in rc:
+                self.max_retries = int(rc["max_retries"])
+            if "server_render_tiles" in rc:
+                self.server_render_tiles = bool(rc["server_render_tiles"])
+            if rc.get("startup_mode") == "worker":
+                self.startup_mode = "worker"
+
         return {
             "ok": True,
             "transfer_id": transfer_id,
@@ -1573,10 +1754,9 @@ class DistributedRenderManager:
 
     def start_distributed_render(self):
         if self.role != "server":
-            self.status = "Starte Server vor Render"
-            if not self.force_start_server():
-                self.last_error = self.status
-                return False
+            self.last_error = "Distributed Render setzt Server-Rolle voraus. Zuerst Cluster als Server starten."
+            self.status = self.last_error
+            return False
 
         scene = _safe_scene()
         if scene is None:
@@ -1671,9 +1851,19 @@ class DistributedRenderManager:
             self.job_attempts[tile["id"]] = 0
             self.job_queue.append(job)
 
-        # Prime each target with one job.
-        for target in self.dispatch_targets:
-            self._dispatch_next_job_for_target(target)
+        # Pre-distribute an initial batch of jobs to keep workers busy even
+        # when the timer-based dispatch loop has a short delay.  Each target
+        # receives up to `prefill` jobs so that a target finishing its first
+        # job always has a second one ready in its local send-buffer.
+        # A third of the total tiles (rounded up, min 1) is used as the burst
+        # budget to avoid over-filling small queues.
+        total_targets = max(1, len(self.dispatch_targets))
+        total_tiles = len(tiles)
+        burst_budget = max(1, (total_tiles + 2) // 3)  # ceil(total_tiles / 3)
+        prefill = max(1, burst_budget // total_targets)
+        for _ in range(prefill):
+            for target in self.dispatch_targets:
+                self._dispatch_next_job_for_target(target)
 
         self.status = f"Render gestartet: {len(tiles)} Tiles, {len(self.dispatch_targets)} Ziele"
         return True
@@ -1775,10 +1965,9 @@ class DistributedRenderManager:
 
     def sync_project_files(self, timeout_seconds=180.0):
         if self.role != "server":
-            self.status = "Starte Server vor Projekt-Sync"
-            if not self.force_start_server():
-                self.last_error = self.status
-                return False
+            self.last_error = "Projekt-Sync setzt Server-Rolle voraus. Zuerst Cluster als Server starten."
+            self.status = self.last_error
+            return False
 
         scene = _safe_scene()
         if scene is not None:
@@ -1887,8 +2076,9 @@ class DistributedRenderManager:
         self.job_owner.pop(tile_id, None)
         if owner:
             self.target_inflight[owner] = max(0, int(self.target_inflight.get(owner, 1)) - 1)
-            # A finished target becomes immediately dispatch-eligible.
-            self.target_ready_at[owner] = time.time()
+            # Set ready_at to 0.0 so the guard `time.time() < target_ready_at` is always
+            # False, guaranteeing immediate re-dispatch eligibility (Issue #2 fix).
+            self.target_ready_at[owner] = 0.0
             self._dispatch_next_job_for_target(owner)
 
         done = len(self.completed_jobs)
@@ -1898,6 +2088,45 @@ class DistributedRenderManager:
 
     def _finalize_render(self):
         if not self.current_render_config:
+            return
+
+        # --- Tile audit pass -------------------------------------------
+        # Check for any tiles that are still pending or in the queue but
+        # were never completed (e.g. because their worker died without the
+        # disconnect handler firing).  Re-queue them so they are retried
+        # before stitching.
+        missing_ids = [
+            tid for tid in self.job_attempts
+            if tid not in self.completed_jobs
+        ]
+        # Build a set of tile_ids currently in job_queue once so we can
+        # check membership in O(1) rather than O(queue_size) per tile.
+        queued_ids: set = {j.get("tile_id") for j in self.job_queue}
+        for tile_id in missing_ids:
+            if tile_id in self.pending_jobs:
+                self._reassign_tile(tile_id, "Tile-Audit: kein Ergebnis empfangen")
+            elif tile_id in queued_ids:
+                pass  # still queued — will be dispatched normally
+            else:
+                # Job was lost without entering pending_jobs; re-enqueue it
+                job = next(
+                    (j for j in (list(self.pending_jobs.values()) + self.job_queue)
+                     if j.get("tile_id") == tile_id),
+                    None,
+                )
+                if job is not None:
+                    self.job_queue.append(job)
+                    queued_ids.add(tile_id)
+
+        # If the audit found missing tiles, abort stitching for now — the
+        # dispatch loop will keep running and call _finalize_render again.
+        still_pending = [
+            tid for tid in missing_ids if tid not in self.completed_jobs
+        ]
+        if still_pending or self.pending_jobs or self.job_queue:
+            self.status = (
+                f"Tile-Audit: {len(still_pending)} fehlende Tiles werden neu zugewiesen"
+            )
             return
 
         try:
@@ -1915,6 +2144,113 @@ class DistributedRenderManager:
             self.status = self.last_error
             traceback.print_exc()
 
+        # Advance to the next camera in a batch render (if one is active).
+        self._advance_batch_camera()
+
+    # ------------------------------------------------------------------
+    # Batch camera render
+    # ------------------------------------------------------------------
+
+    def start_batch_camera_render(self, camera_names: list) -> bool:
+        """Start a sequential render across multiple cameras.
+
+        For each camera in *camera_names* the full tile-render + stitch
+        cycle runs in order.  The stitched result is saved to
+        ``<output_dir>/<camera_name>/distributed_render.png``.
+
+        After the last camera the batch ends and ``status`` is set to a
+        summary string.  Workers are never restarted between cameras —
+        only the scene camera is swapped between passes.
+
+        Returns ``True`` if the batch was queued, ``False`` on error.
+        """
+        if self.role != "server":
+            self.last_error = "Batch Render setzt Server-Rolle voraus."
+            self.status = self.last_error
+            return False
+        if not camera_names:
+            self.last_error = "Keine Kamera für Batch-Render angegeben."
+            self.status = self.last_error
+            return False
+
+        scene = _safe_scene()
+        if scene is None:
+            self.last_error = "Keine aktive Szene"
+            self.status = self.last_error
+            return False
+
+        # Validate cameras exist
+        valid: list[str] = []
+        for name in camera_names:
+            name = str(name).strip()
+            if not name:
+                continue
+            if name not in bpy.data.objects:
+                self.last_error = f"Kamera '{name}' nicht gefunden."
+                self.status = self.last_error
+                return False
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.type != "CAMERA":
+                self.last_error = f"Objekt '{name}' ist keine Kamera."
+                self.status = self.last_error
+                return False
+            valid.append(name)
+
+        if not valid:
+            self.last_error = "Keine gültigen Kameras gefunden."
+            self.status = self.last_error
+            return False
+
+        self._batch_camera_queue = valid
+        self._batch_camera_index = 0
+        self.status = f"Batch Render gestartet: {len(valid)} Kamera(s)"
+        return self._render_batch_camera_at_index()
+
+    def _render_batch_camera_at_index(self) -> bool:
+        """Set the active camera for the current batch index and start a render."""
+        idx = self._batch_camera_index
+        queue = self._batch_camera_queue
+        if idx >= len(queue):
+            return False
+
+        camera_name = queue[idx]
+        scene = _safe_scene()
+        if scene is None:
+            self.last_error = "Keine aktive Szene beim Batch-Wechsel"
+            self.status = self.last_error
+            self._batch_camera_queue = []
+            return False
+
+        obj = bpy.data.objects.get(camera_name)
+        if obj is None:
+            self.last_error = f"Kamera '{camera_name}' verschwunden"
+            self.status = self.last_error
+            self._batch_camera_queue = []
+            return False
+
+        scene.camera = obj
+        self.status = f"Batch Render Kamera {idx + 1}/{len(queue)}: {camera_name}"
+        return self.start_distributed_render()
+
+    def _advance_batch_camera(self) -> None:
+        """Called by _finalize_render to move to the next camera in the batch."""
+        if not self._batch_camera_queue:
+            return
+
+        self._batch_camera_index += 1
+        idx = self._batch_camera_index
+        total = len(self._batch_camera_queue)
+
+        if idx >= total:
+            # All cameras done
+            self._batch_camera_queue = []
+            self._batch_camera_index = 0
+            self.status = f"Batch Render abgeschlossen ({total} Kamera(s))"
+            return
+
+        # Kick off next camera's render
+        self._render_batch_camera_at_index()
+
     def _reassign_jobs_from_worker(self, worker_id):
         if worker_id in self.dispatch_targets:
             self.dispatch_targets = [t for t in self.dispatch_targets if t != worker_id]
@@ -1927,6 +2263,25 @@ class DistributedRenderManager:
 
         for target in list(self.dispatch_targets):
             self._dispatch_next_job_for_target(target)
+
+    def _purge_stale_workers(self) -> None:
+        """Disconnect workers that have not sent a heartbeat recently (BUG-18 fix).
+
+        Workers are expected to send MSG_HEARTBEAT every ~30 s (ping_interval).
+        Any worker whose ``last_seen`` timestamp is more than
+        ``STALE_WORKER_TIMEOUT_S`` seconds old is treated as dead: its pending
+        jobs are reassigned and it is removed from ``connected_workers``.
+        """
+        now = time.time()
+        stale = [
+            wid
+            for wid, info in list(self.connected_workers.items())
+            if now - float(info.get("last_seen", now)) > self.STALE_WORKER_TIMEOUT_S
+        ]
+        for worker_id in stale:
+            self._reassign_jobs_from_worker(worker_id)
+            self.connected_workers.pop(worker_id, None)
+            self.status = f"Staler Worker entfernt: {worker_id} ({len(self.connected_workers)} verbleibend)"
 
     def _reassign_tile(self, tile_id, reason):
         if tile_id not in self.pending_jobs:
@@ -2094,6 +2449,8 @@ class DistributedRenderManager:
             "tiles_chunked": 0,
             "chunk_messages": 0,
         }
+        self._batch_camera_queue = []
+        self._batch_camera_index = 0
 
         if hard:
             scene = _safe_scene()
@@ -2123,8 +2480,51 @@ class DistributedRenderManager:
 
         return True
 
-    def kick_all_workers(self):
+    def kick_all_workers(self, clean_first: bool = True):
+        """Disconnect all workers from the cluster.
+
+        Parameters
+        ----------
+        clean_first:
+            When True (the default) each worker receives a MSG_CLEAN_BLEND
+            command before the socket is closed, so that received .blend
+            copies are removed even though the worker will immediately
+            reconnect.  This avoids the "clean doesn't work after kick" bug
+            because the clean is performed *before* the connection is torn
+            down.
+        """
         ids = list(self.connected_workers.keys())
+        if not ids:
+            self.status = "Keine Worker verbunden"
+            return True
+
+        if clean_first and self._loop:
+            # Best-effort: send MSG_CLEAN_BLEND to every connected worker and
+            # wait briefly for acknowledgements before tearing down sockets.
+            async def _send_clean():
+                for worker_id in ids:
+                    info = self.connected_workers.get(worker_id)
+                    ws = info.get("socket") if info else None
+                    if ws:
+                        try:
+                            await ws.send(json_dumps({"type": MSG_CLEAN_BLEND}))
+                        except Exception:
+                            pass
+                # Give workers up to 3 s to process the clean command and
+                # send back their ACK before sockets are closed.
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if len(self.clean_results) >= len(ids):
+                        break
+                    await asyncio.sleep(0.1)
+
+            self.clean_results = {}
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_send_clean(), self._loop)
+                fut.result(timeout=5.0)
+            except Exception:
+                pass
+
         for worker_id in ids:
             info = self.connected_workers.get(worker_id)
             ws = info.get("socket") if info else None
@@ -2136,7 +2536,6 @@ class DistributedRenderManager:
             self.connected_workers.pop(worker_id, None)
             self.worker_sync_state = {}
             self.project_sync_results = {}
-            self.clean_results = {}
             self._defer_master_until_workers_primed = False
         self.status = f"Alle Worker getrennt ({len(ids)})"
         return True

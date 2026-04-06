@@ -9,6 +9,9 @@ from typing import Protocol, cast
 
 from .orchestrator import RuntimeOperation, RuntimeOrchestrator
 
+# Cached reference to the legacy worker module – resolved once per process.
+_legacy_worker_module: ModuleType | None = None
+
 Scalar = str | int | float | bool | None
 
 
@@ -107,7 +110,8 @@ class PanelStatus:
 class SplitterRuntimeFacade:
     """Small API surface for runtime operations.
 
-    TODO: Wire calls incrementally to current `worker.py` manager.
+    Imports the legacy manager directly from ``src.legacy.worker`` to avoid
+    going through the root-level compatibility wrappers.
     """
 
     def __init__(self, config: RuntimeConfig | None = None) -> None:
@@ -116,30 +120,60 @@ class SplitterRuntimeFacade:
         self._orchestrator: RuntimeOrchestrator = RuntimeOrchestrator()
         self._legacy_error: str = ""
 
-    def _get_legacy_manager(self) -> LegacyManager | None:
-        module: ModuleType | None = None
-        try:
-            module = importlib.import_module("worker")
-        except ImportError:
-            module = None
+    def _get_legacy_module(self) -> ModuleType | None:
+        """Return the legacy worker module, importing it once and caching it.
 
-        if module is None:
+        Import order (most-specific first, avoids relying on root wrappers):
+        1. ``<root_package>.src.legacy.worker`` – correct path within the
+           installed add-on package.
+        2. ``src.legacy.worker`` – fallback when running without a package
+           root (e.g. bare Python path during development).
+
+        On failure stores a structured diagnostic message in ``_legacy_error``
+        that includes every attempted module path and the exception raised for
+        each attempt (Issue #4/#5 fix).
+        """
+        global _legacy_worker_module
+        if _legacy_worker_module is not None:
+            return _legacy_worker_module
+
+        package_name = __package__ or ""
+        root_package = package_name.split(".")[0] if package_name else ""
+
+        candidates: list[str] = []
+        if root_package:
+            candidates.append(f"{root_package}.src.legacy.worker")
+        candidates.append("src.legacy.worker")
+
+        failures: list[str] = []
+        for candidate in candidates:
             try:
-                package_name = __package__ or ""
-                root_package = package_name.split(".")[0] if package_name else ""
-                if root_package:
-                    module = importlib.import_module(f"{root_package}.worker")
-            except ImportError:
-                module = None
+                mod = importlib.import_module(candidate)
+                _legacy_worker_module = mod
+                return mod
+            except ImportError as exc:
+                failures.append(f"  [{candidate}]: {exc}")
 
+        self._legacy_error = (
+            "Legacy-Worker-Modul konnte nicht importiert werden. "
+            f"Versuchte Pfade:\n" + "\n".join(failures)
+        )
+        return None
+
+    def _get_legacy_manager(self) -> LegacyManager | None:
+        """Return the singleton legacy ``DistributedRenderManager``."""
+        module = self._get_legacy_module()
         if module is None:
-            self._legacy_error = "Legacy-Manager nicht importierbar"
+            # _legacy_error was already populated with structured details.
             return None
         try:
             legacy_module = cast(LegacyWorkerModule, cast(object, module))
             return legacy_module.manager()
         except (AttributeError, TypeError, RuntimeError, ValueError) as exc:
-            self._legacy_error = f"Legacy-Manager Aufruf fehlgeschlagen: {exc}"
+            self._legacy_error = (
+                f"Legacy-Manager-Aufruf fehlgeschlagen "
+                f"({type(exc).__name__}): {exc}"
+            )
             return None
 
     def _apply_config_to_legacy(self, mgr: LegacyManager) -> None:

@@ -1,5 +1,5 @@
 {
-    "mode": "worker",
+    "mode": "master_worker",
     "user_mode": "master_worker",
     "always": [],
     "network": {
@@ -12,7 +12,7 @@
         "max_retries": 3,
         "auto_sync_project": true,
         "show_render_window": true,
-        "server_render_tiles": false,
+        "server_render_tiles": true,
         "tile_coefficient": 1,
         "output_dir": ""
     },

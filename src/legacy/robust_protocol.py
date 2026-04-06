@@ -21,6 +21,11 @@ MSG_PROJECT_SYNC_ACK = "project_sync_ack"
 MSG_CLEAN_BLEND = "clean_blend"
 MSG_CLEAN_BLEND_ACK = "clean_blend_ack"
 
+# Sent by old master to all remaining workers when it grants server rights to a
+# new node.  Workers wait MSG_NEW_MASTER_DELAY_S seconds then reconnect.
+MSG_NEW_MASTER = "new_master"
+MSG_NEW_MASTER_DELAY_S = 2.0
+
 
 def dumps(payload: dict) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)

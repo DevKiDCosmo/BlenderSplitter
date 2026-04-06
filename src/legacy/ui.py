@@ -391,6 +391,18 @@ class BLENDERSPLITTER_OT_stop_network(bpy.types.Operator):
 class BLENDERSPLITTER_OT_start_server(bpy.types.Operator):
     bl_idname = "blendersplitter.start_server"
     bl_label = "Force Server"
+    bl_description = (
+        "Take over server role from the current master. "
+        "Only available when this node is connected as a worker."
+    )
+
+    @classmethod
+    def poll(cls, context):
+        """Enable only when this node is already connected as a worker."""
+        mgr = _get_mgr()
+        if mgr is None:
+            return False
+        return bool(mgr.started and mgr.role == "worker")
 
     def execute(self, context):
         _apply_runtime_controller_config(context)
@@ -468,6 +480,61 @@ class BLENDERSPLITTER_OT_distributed_render(bpy.types.Operator):
             self.report({"ERROR"}, new_error or "Render konnte nicht gestartet werden")
             return {"CANCELLED"}
         self.report({"INFO"}, "Render gestartet")
+        return {"FINISHED"}
+
+
+class BLENDERSPLITTER_OT_abort_render(bpy.types.Operator):
+    bl_idname = "blendersplitter.abort_render"
+    bl_label = "Abort Render"
+
+    def execute(self, context):
+        _apply_runtime_controller_config(context)
+        prev_error = _ui_controller.last_error()
+        _ui_controller.cancel_render()
+        new_error = _ui_controller.last_error()
+        if new_error and new_error != prev_error:
+            self.report({"ERROR"}, new_error)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Render abgebrochen")
+        return {"FINISHED"}
+
+
+class BLENDERSPLITTER_OT_batch_camera_render(bpy.types.Operator):
+    bl_idname = "blendersplitter.batch_camera_render"
+    bl_label = "Batch Camera Render"
+    bl_description = (
+        "Render all tiles for each camera listed in 'Batch Cameras', stitch "
+        "after each pass, then advance to the next camera automatically."
+    )
+
+    @classmethod
+    def poll(cls, context):
+        mgr = _get_mgr()
+        if mgr is None:
+            return False
+        cfg = context.scene.blendersplitter_settings
+        cameras_raw = str(getattr(cfg, "batch_cameras", "") or "").strip()
+        return bool(mgr.started and mgr.role == "server" and cameras_raw)
+
+    def execute(self, context):
+        _apply_runtime_controller_config(context)
+        cfg = context.scene.blendersplitter_settings
+        cameras_raw = str(getattr(cfg, "batch_cameras", "") or "").strip()
+        if not cameras_raw:
+            self.report({"ERROR"}, "Keine Kameras angegeben (Batch Cameras Feld leer)")
+            return {"CANCELLED"}
+
+        camera_names = [c.strip() for c in cameras_raw.split(",") if c.strip()]
+        mgr = _get_mgr()
+        if mgr is None:
+            self.report({"ERROR"}, "Manager nicht verfügbar")
+            return {"CANCELLED"}
+
+        ok = mgr.start_batch_camera_render(camera_names)
+        if not ok:
+            self.report({"ERROR"}, _ui_controller.last_error() or "Batch Render fehlgeschlagen")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Batch Render gestartet: {len(camera_names)} Kamera(s)")
         return {"FINISHED"}
 
 
@@ -649,31 +716,40 @@ class BLENDERSPLITTER_PG_settings_v2(bpy.types.PropertyGroup):
     show_render_window: bpy.props.BoolProperty(name="Show Render Window", default=True, update=_settings_updated)
     server_render_tiles: bpy.props.BoolProperty(name="Server Render Tiles", default=True, update=_settings_updated)
     output_dir: bpy.props.StringProperty(name="Output Folder", subtype="DIR_PATH", default="", update=_settings_updated)
+    # Batch camera: comma-separated camera names.  Leave blank for single-camera render.
+    batch_cameras: bpy.props.StringProperty(
+        name="Batch Cameras",
+        description="Comma-separated camera names for sequential batch render. Leave blank for single-camera render.",
+        default="",
+        update=_settings_updated,
+    )
 
 
 class BLENDERSPLITTER_OT_reset_runtime(bpy.types.Operator):
     bl_idname = "blendersplitter.reset_runtime"
-    bl_label = "Reset"
+    bl_label = "Update Information"
+    bl_description = "Refresh runtime state and re-sync configuration from scene settings"
 
     def execute(self, context):
         if not _ui_controller.reset_runtime(hard=False):
-            self.report({"ERROR"}, _ui_controller.last_error() or "Reset failed")
+            self.report({"ERROR"}, _ui_controller.last_error() or "Update failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Reset completed")
+        self.report({"INFO"}, "Information updated")
         return {"FINISHED"}
 
 
 class BLENDERSPLITTER_OT_hard_reset_runtime(bpy.types.Operator):
     bl_idname = "blendersplitter.hard_reset_runtime"
-    bl_label = "Hard Reset"
+    bl_label = "Reset"
+    bl_description = "Full reset: clear all state and restore default settings"
 
     def execute(self, context):
         if not _ui_controller.reset_runtime(hard=True):
-            self.report({"ERROR"}, _ui_controller.last_error() or "Hard reset failed")
+            self.report({"ERROR"}, _ui_controller.last_error() or "Reset failed")
             return {"CANCELLED"}
         _sync_runtime_settings(context)
-        self.report({"INFO"}, "Hard reset completed")
+        self.report({"INFO"}, "Reset completed")
         return {"FINISHED"}
 
 
@@ -717,22 +793,31 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
             summary.label(text=f"Rendered: {len(mgr.completed_jobs)}/{mgr.expected_jobs}")
             summary.label(text=f"Pending/In-Flight: {len(mgr.job_queue)}/{len(mgr.pending_jobs)}")
 
+        has_workers = mgr is not None and bool(mgr.connected_workers)
+        is_server = model.role == "server"
+
         row = layout.row(align=True)
         row.operator("blendersplitter.start_network", icon="PLAY")
         row.operator("blendersplitter.stop_network", icon="PAUSE")
 
+        # Force Server: poll() disables it unless role == "worker"
         layout.operator("blendersplitter.start_server", icon="NETWORK_DRIVE")
         layout.operator("blendersplitter.cluster_monitor_popup", icon="WINDOW")
 
         layout.separator()
         layout.operator("blendersplitter.install_requirements", icon="CONSOLE")
-        row = layout.row()
-        row.enabled = not is_worker
+
+        # Sync / Clean — visually consistent with start/stop (align=True).
+        row = layout.row(align=True)
+        row.enabled = not is_worker and has_workers
         row.operator("blendersplitter.sync_project_files", icon="FILE_REFRESH")
         row.operator("blendersplitter.clean_worker_blends", icon="TRASH")
+        if not is_worker and not has_workers and model.started:
+            layout.label(text="No workers connected yet", icon="INFO")
 
+        # Update Information / Reset — available for all roles (workers can refresh
+        # their own state too; actual runtime actions are no-ops for workers).
         row = layout.row(align=True)
-        row.enabled = not is_worker
         row.operator("blendersplitter.reset_runtime", icon="LOOP_BACK")
         row.operator("blendersplitter.hard_reset_runtime", icon="FILE_REFRESH")
 
@@ -744,13 +829,22 @@ class BLENDERSPLITTER_PT_panel(bpy.types.Panel):
         row.enabled = not is_worker
         row.operator("blendersplitter.distributed_render", icon="RENDER_STILL")
 
+        # Batch camera render
+        row = layout.row()
+        row.enabled = not is_worker
+        row.prop(cfg, "batch_cameras", icon="CAMERA_DATA")
+
+        row = layout.row()
+        row.enabled = not is_worker
+        row.operator("blendersplitter.batch_camera_render", icon="CAMERA_DATA")
+
         row = layout.row(align=True)
         row.enabled = not is_worker
         row.operator("blendersplitter.abort_render", icon="CANCEL")
         row.operator("blendersplitter.kick_all", icon="X")
 
         if is_worker:
-            layout.label(text="Server actions are disabled in worker mode")
+            layout.label(text="Server-Aktionen im Worker-Modus deaktiviert", icon="INFO")
 
         layout.separator()
         _draw_cluster_monitor(layout, mgr)
@@ -856,6 +950,7 @@ CLASSES = (
     BLENDERSPLITTER_OT_sync_project_files,
     BLENDERSPLITTER_OT_dry_run_integrity,
     BLENDERSPLITTER_OT_distributed_render,
+    BLENDERSPLITTER_OT_batch_camera_render,
     BLENDERSPLITTER_OT_abort_render,
     BLENDERSPLITTER_OT_kick_all,
     BLENDERSPLITTER_OT_toggle_preview_overlay,

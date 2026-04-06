@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from typing import cast
 
 from .models import AppConfig, ConfigDict, ConfigValue
+
+_log = logging.getLogger(__name__)
 
 
 class ConfigStore:
@@ -14,9 +18,22 @@ class ConfigStore:
         self._config: AppConfig = AppConfig()
 
     def load(self) -> AppConfig:
+        """Read and parse *config_path*, merging values into the default config.
+
+        If the file is absent or malformed, the last-known (or default)
+        ``AppConfig`` is returned and a debug message is logged.
+        """
         if not self._config_path.exists():
             return self._config
-        _ = self._config_path.read_text(encoding="utf-8")
+        try:
+            raw_text = self._config_path.read_text(encoding="utf-8")
+            raw: dict[str, object] = json.loads(raw_text)
+            if not isinstance(raw, dict):
+                _log.debug("ConfigStore.load: expected JSON object, got %s", type(raw).__name__)
+                return self._config
+            self._config = self._merge(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.debug("ConfigStore.load: could not read config (%s)", exc)
         return self._config
 
     def get(self) -> AppConfig:
